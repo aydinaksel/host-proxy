@@ -1,0 +1,15 @@
+[package]
+name = "host-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "host-proxy"
+path = "src/main.rs"
+
+[dependencies]
+pingora = { version = "0.8", features = ["rustls", "proxy"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+async-trait = "0.1"
