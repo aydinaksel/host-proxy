@@ -8,10 +8,14 @@ use pingora::prelude::*;
 use pingora::proxy::{ProxyHttp, Session};
 use pingora::tls::nid::Nid;
 use pingora::tls::pkey::PKey;
-use pingora::tls::ssl::{NameType, SslContext, SslMethod, SslRef};
+use pingora::tls::ssl::{
+    AlpnError, NameType, SslContext, SslMethod, SslRef, select_next_proto,
+};
 use pingora::tls::x509::X509;
 use pingora::{Error, ErrorType};
 use tracing::{Level, event};
+
+const NEGOTIATED_ALPN_PROTOCOLS: &[u8] = b"\x02h2\x08http/1.1";
 
 pub struct Certificate {
     certificate_path: String,
@@ -58,6 +62,10 @@ impl Certificate {
         context_builder
             .set_private_key(&private_key)
             .expect("failed to set private key on SSL context");
+        context_builder.set_alpn_select_callback(|_ssl, client_protocols| {
+            select_next_proto(NEGOTIATED_ALPN_PROTOCOLS, client_protocols)
+                .ok_or(AlpnError::NOACK)
+        });
         let ssl_context = context_builder.build();
 
         let mut hostnames = Vec::new();
