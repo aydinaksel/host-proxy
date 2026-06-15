@@ -34,9 +34,13 @@ impl Certificate {
             panic!("failed to read {}: {error}", self.private_key_path)
         });
 
-        let x509 = X509::from_pem(&certificate_pem).unwrap_or_else(|error| {
+        let chain = X509::stack_from_pem(&certificate_pem).unwrap_or_else(|error| {
             panic!("invalid certificate {}: {error}", self.certificate_path)
         });
+        let x509 = chain
+            .first()
+            .expect("certificate file is empty")
+            .clone();
         let private_key = PKey::private_key_from_pem(&private_key_pem).unwrap_or_else(|error| {
             panic!("invalid private key {}: {error}", self.private_key_path)
         });
@@ -46,6 +50,11 @@ impl Certificate {
         context_builder
             .set_certificate(&x509)
             .expect("failed to set certificate on SSL context");
+        for intermediate in chain.iter().skip(1) {
+            context_builder
+                .add_extra_chain_cert(intermediate.clone())
+                .expect("failed to add intermediate certificate");
+        }
         context_builder
             .set_private_key(&private_key)
             .expect("failed to set private key on SSL context");
