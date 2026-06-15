@@ -44,6 +44,7 @@
           ];
 
           buildInputs = [
+            pkgs.openssl
             pkgs.zstd
           ];
 
@@ -79,6 +80,7 @@
           ];
 
           buildInputs = [
+            pkgs.openssl
             pkgs.zstd
           ];
 

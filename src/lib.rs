@@ -1,49 +1,110 @@
 use std::collections::HashMap;
+use std::fs;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use pingora::http::ResponseHeader;
 use pingora::prelude::*;
 use pingora::proxy::{ProxyHttp, Session};
+use pingora::tls::nid::Nid;
+use pingora::tls::pkey::PKey;
+use pingora::tls::ssl::{NameType, SslContext, SslMethod, SslRef};
+use pingora::tls::x509::X509;
 use pingora::{Error, ErrorType};
 use tracing::{Level, event};
 
-/// A reverse proxy that owns ports 80 and 443 on a host and routes
-/// requests to upstream addresses by exact hostname match.
-///
-/// Port 443 terminates TLS with a single certificate, which must cover
-/// every routed hostname. Port 80 only redirects to HTTPS. Requests for
-/// hostnames without a route receive a 404 and never reach an upstream.
-///
-/// ```no_run
-/// use host_proxy::HostProxy;
-///
-/// HostProxy::new()
-///     .route("example.org", "127.0.0.1:3000")
-///     .route("www.example.org", "127.0.0.1:3000")
-///     .certificate(
-///         "/var/lib/acme/example.org/fullchain.pem",
-///         "/var/lib/acme/example.org/key.pem",
-///     )
-///     .run();
-/// ```
+pub struct Certificate {
+    certificate_path: String,
+    private_key_path: String,
+}
+
+impl Certificate {
+    pub fn new(certificate_path: String, private_key_path: String) -> Self {
+        Certificate {
+            certificate_path,
+            private_key_path,
+        }
+    }
+
+    fn load(&self) -> LoadedCertificate {
+        let certificate_pem = fs::read(&self.certificate_path).unwrap_or_else(|error| {
+            panic!("failed to read {}: {error}", self.certificate_path)
+        });
+        let private_key_pem = fs::read(&self.private_key_path).unwrap_or_else(|error| {
+            panic!("failed to read {}: {error}", self.private_key_path)
+        });
+
+        let x509 = X509::from_pem(&certificate_pem).unwrap_or_else(|error| {
+            panic!("invalid certificate {}: {error}", self.certificate_path)
+        });
+        let private_key = PKey::private_key_from_pem(&private_key_pem).unwrap_or_else(|error| {
+            panic!("invalid private key {}: {error}", self.private_key_path)
+        });
+
+        let mut context_builder = SslContext::builder(SslMethod::tls())
+            .expect("failed to create SSL context builder");
+        context_builder
+            .set_certificate(&x509)
+            .expect("failed to set certificate on SSL context");
+        context_builder
+            .set_private_key(&private_key)
+            .expect("failed to set private key on SSL context");
+        let ssl_context = context_builder.build();
+
+        let mut hostnames = Vec::new();
+        if let Some(common_name) = x509
+            .subject_name()
+            .entries_by_nid(Nid::COMMONNAME)
+            .next()
+        {
+            if let Ok(name) = common_name.data().as_utf8() {
+                hostnames.push(name.to_string().to_ascii_lowercase());
+            }
+        }
+        if let Some(san) = x509.subject_alt_names() {
+            for name in san {
+                if let Some(dns_name) = name.dnsname() {
+                    hostnames.push(dns_name.to_ascii_lowercase());
+                }
+            }
+        }
+
+        LoadedCertificate {
+            hostnames,
+            ssl_context,
+        }
+    }
+}
+
+struct LoadedCertificate {
+    hostnames: Vec<String>,
+    ssl_context: SslContext,
+}
+
+struct CertificateResolver {
+    contexts_by_hostname: HashMap<String, Arc<SslContext>>,
+}
+
+impl CertificateResolver {
+    fn resolve(&self, server_name: &str) -> Option<&Arc<SslContext>> {
+        self.contexts_by_hostname
+            .get(&server_name.to_ascii_lowercase())
+    }
+}
+
 pub struct HostProxy {
     upstream_addresses_by_hostname: HashMap<String, String>,
-    certificate_file: Option<String>,
-    private_key_file: Option<String>,
+    certificates: Vec<Certificate>,
 }
 
 impl HostProxy {
     pub fn new() -> Self {
         HostProxy {
             upstream_addresses_by_hostname: HashMap::new(),
-            certificate_file: None,
-            private_key_file: None,
+            certificates: Vec::new(),
         }
     }
 
-    /// Routes requests for `hostname` to `upstream_address`, an address
-    /// such as `127.0.0.1:3000`. Matching is exact and case-insensitive,
-    /// so subdomains need their own routes.
     pub fn route(
         mut self,
         hostname: impl Into<String>,
@@ -54,34 +115,18 @@ impl HostProxy {
         self
     }
 
-    /// Sets the PEM certificate and private key presented on port 443.
-    pub fn certificate(
-        mut self,
-        certificate_file: impl Into<String>,
-        private_key_file: impl Into<String>,
-    ) -> Self {
-        self.certificate_file = Some(certificate_file.into());
-        self.private_key_file = Some(private_key_file.into());
+    pub fn certificate(mut self, certificate: Certificate) -> Self {
+        self.certificates.push(certificate);
         self
     }
 
-    /// Starts the proxy and never returns.
-    ///
-    /// Panics if no routes are configured or the certificate is missing,
-    /// since a host proxy that cannot serve anything should fail loudly
-    /// at startup.
     pub fn run(self) -> ! {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
         if self.upstream_addresses_by_hostname.is_empty() {
-            panic!("no routes configured, call route() before run()");
+            panic!("no routes configured");
         }
-        let certificate_file = self
-            .certificate_file
-            .expect("no certificate configured, call certificate() before run()");
-        let private_key_file = self
-            .private_key_file
-            .expect("no private key configured, call certificate() before run()");
+        if self.certificates.is_empty() {
+            panic!("no certificates configured");
+        }
 
         for (hostname, upstream_address) in &self.upstream_addresses_by_hostname {
             event!(
@@ -93,6 +138,27 @@ impl HostProxy {
             );
         }
 
+        let mut contexts_by_hostname = HashMap::new();
+        let first_certificate = &self.certificates[0];
+
+        for certificate in &self.certificates {
+            let loaded = certificate.load();
+            let shared_context = Arc::new(loaded.ssl_context);
+            for hostname in &loaded.hostnames {
+                event!(
+                    name: "proxy.certificate.loaded",
+                    Level::INFO,
+                    certificate.hostname = hostname,
+                    "loaded certificate for {{certificate.hostname}}",
+                );
+                contexts_by_hostname.insert(hostname.clone(), Arc::clone(&shared_context));
+            }
+        }
+
+        let resolver = Arc::new(CertificateResolver {
+            contexts_by_hostname,
+        });
+
         let mut server = Server::new(None).expect("failed to create pingora server");
         server.bootstrap();
 
@@ -102,11 +168,23 @@ impl HostProxy {
                 upstream_addresses_by_hostname: self.upstream_addresses_by_hostname,
             },
         );
+
         let mut tls_settings = pingora::listeners::tls::TlsSettings::intermediate(
-            &certificate_file,
-            &private_key_file,
+            &first_certificate.certificate_path,
+            &first_certificate.private_key_path,
         )
-        .expect("failed to configure TLS");
+        .expect("failed to create TLS settings");
+
+        let sni_resolver = Arc::clone(&resolver);
+        tls_settings.set_servername_callback(move |ssl: &mut SslRef, _| {
+            if let Some(server_name) = ssl.servername(NameType::HOST_NAME) {
+                if let Some(context) = sni_resolver.resolve(server_name) {
+                    ssl.set_ssl_context(context).ok();
+                }
+            }
+            Ok(())
+        });
+
         tls_settings.enable_h2();
         router_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings);
 

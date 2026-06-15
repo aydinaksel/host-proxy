@@ -13,6 +13,11 @@ let
       hostname: upstreamAddress: "${hostname}=${upstreamAddress}"
     ) hostProxyConfiguration.routes
   );
+  certificatesSpecification = lib.concatStringsSep "," (
+    map (
+      certificate: "${certificate.certificateFile}:${certificate.privateKeyFile}"
+    ) hostProxyConfiguration.certificates
+  );
 in
 {
   options.services.hostProxy = {
@@ -31,18 +36,24 @@ in
       };
     };
 
-    certificateFile = lib.mkOption {
-      type = lib.types.str;
+    certificates = lib.mkOption {
+      type = lib.types.listOf (lib.types.submodule {
+        options = {
+          certificateFile = lib.mkOption {
+            type = lib.types.str;
+            description = "Path to the PEM certificate file.";
+          };
+          privateKeyFile = lib.mkOption {
+            type = lib.types.str;
+            description = "Path to the PEM private key file.";
+          };
+        };
+      });
       description = ''
-        Path to the PEM certificate presented on port 443. Must be
-        readable by the host-proxy user and cover every hostname in
-        routes.
+        TLS certificates to present on port 443. Pingora selects the
+        correct certificate per connection using SNI. Each certificate
+        should cover one or more hostnames listed in routes.
       '';
-    };
-
-    privateKeyFile = lib.mkOption {
-      type = lib.types.str;
-      description = "Path to the PEM private key for certificateFile.";
     };
 
     openFirewall = lib.mkOption {
@@ -72,8 +83,7 @@ in
 
       environment = {
         HOST_PROXY_ROUTES = routesSpecification;
-        HOST_PROXY_CERTIFICATE_FILE = hostProxyConfiguration.certificateFile;
-        HOST_PROXY_PRIVATE_KEY_FILE = hostProxyConfiguration.privateKeyFile;
+        HOST_PROXY_CERTIFICATES = certificatesSpecification;
         RUST_LOG = "info";
       };
 
