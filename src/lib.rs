@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,6 +17,27 @@ use pingora::{Error, ErrorType};
 use tracing::{Level, event};
 
 const NEGOTIATED_ALPN_PROTOCOLS: &[u8] = b"\x02h2\x08http/1.1";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    Public,
+    Private,
+}
+
+fn is_private_client(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(ipv4) => {
+            // Tailscale CGNAT: 100.64.0.0/10
+            let octets = ipv4.octets();
+            let is_tailscale = octets[0] == 100 && (octets[1] & 0xC0) == 64;
+
+            ipv4.is_loopback()
+                || ipv4.is_private()
+                || is_tailscale
+        }
+        IpAddr::V6(ipv6) => ipv6.is_loopback(),
+    }
+}
 
 pub struct Certificate {
     certificate_path: String,
@@ -109,15 +131,20 @@ impl CertificateResolver {
     }
 }
 
+struct Route {
+    upstream_address: String,
+    access: Access,
+}
+
 pub struct HostProxy {
-    upstream_addresses_by_hostname: HashMap<String, String>,
+    routes_by_hostname: HashMap<String, Route>,
     certificates: Vec<Certificate>,
 }
 
 impl HostProxy {
     pub fn new() -> Self {
         HostProxy {
-            upstream_addresses_by_hostname: HashMap::new(),
+            routes_by_hostname: HashMap::new(),
             certificates: Vec::new(),
         }
     }
@@ -126,9 +153,15 @@ impl HostProxy {
         mut self,
         hostname: impl Into<String>,
         upstream_address: impl Into<String>,
+        access: Access,
     ) -> Self {
-        self.upstream_addresses_by_hostname
-            .insert(hostname.into().to_ascii_lowercase(), upstream_address.into());
+        self.routes_by_hostname.insert(
+            hostname.into().to_ascii_lowercase(),
+            Route {
+                upstream_address: upstream_address.into(),
+                access,
+            },
+        );
         self
     }
 
@@ -138,20 +171,25 @@ impl HostProxy {
     }
 
     pub fn run(self) -> ! {
-        if self.upstream_addresses_by_hostname.is_empty() {
+        if self.routes_by_hostname.is_empty() {
             panic!("no routes configured");
         }
         if self.certificates.is_empty() {
             panic!("no certificates configured");
         }
 
-        for (hostname, upstream_address) in &self.upstream_addresses_by_hostname {
+        for (hostname, route) in &self.routes_by_hostname {
+            let access_label = match route.access {
+                Access::Public => "public",
+                Access::Private => "private",
+            };
             event!(
                 name: "proxy.route.configured",
                 Level::INFO,
                 server.address = hostname,
-                upstream.address = upstream_address,
-                "routing {{server.address}} to {{upstream.address}}",
+                upstream.address = route.upstream_address,
+                route.access = access_label,
+                "routing {{server.address}} to {{upstream.address}} ({{route.access}})",
             );
         }
 
@@ -182,7 +220,7 @@ impl HostProxy {
         let mut router_service = http_proxy_service(
             &server.configuration,
             HostRouter {
-                upstream_addresses_by_hostname: self.upstream_addresses_by_hostname,
+                routes_by_hostname: self.routes_by_hostname,
             },
         );
         router_service.threads = Some(available_worker_thread_count());
@@ -222,7 +260,7 @@ impl Default for HostProxy {
 }
 
 struct HostRouter {
-    upstream_addresses_by_hostname: HashMap<String, String>,
+    routes_by_hostname: HashMap<String, Route>,
 }
 
 struct RedirectToHttps;
@@ -270,7 +308,7 @@ impl ProxyHttp for HostRouter {
             return Ok(true);
         };
 
-        let Some(upstream_address) = self.upstream_addresses_by_hostname.get(&hostname) else {
+        let Some(route) = self.routes_by_hostname.get(&hostname) else {
             event!(
                 name: "proxy.route.unmatched",
                 Level::WARN,
@@ -282,7 +320,34 @@ impl ProxyHttp for HostRouter {
             return Ok(true);
         };
 
-        *routed_upstream_address = Some(upstream_address.clone());
+        if route.access == Access::Private {
+            let client_address_string = session
+                .client_addr()
+                .map(|address| address.to_string())
+                .unwrap_or_default();
+            let client_ip_string = client_address_string
+                .split(':')
+                .next()
+                .unwrap_or(&client_address_string);
+            let is_allowed = client_ip_string
+                .parse::<IpAddr>()
+                .map(is_private_client)
+                .unwrap_or(false);
+
+            if !is_allowed {
+                event!(
+                    name: "proxy.route.forbidden",
+                    Level::WARN,
+                    server.address = hostname,
+                    client.address = client_ip_string,
+                    "denied public access to private route {{server.address}} from {{client.address}}",
+                );
+                session.respond_error(403).await?;
+                return Ok(true);
+            }
+        }
+
+        *routed_upstream_address = Some(route.upstream_address.clone());
         Ok(false)
     }
 

@@ -1,6 +1,6 @@
 use std::env;
 
-use host_proxy::{Certificate, HostProxy};
+use host_proxy::{Access, Certificate, HostProxy};
 
 const ROUTES_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_ROUTES";
 const CERTIFICATES_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_CERTIFICATES";
@@ -21,13 +21,25 @@ fn main() {
         .split(',')
         .filter(|route_entry| !route_entry.is_empty())
     {
-        let Some((hostname, upstream_address)) = route_entry.split_once('=') else {
+        let Some((hostname, address_and_access)) = route_entry.split_once('=') else {
             panic!(
                 "invalid route entry {route_entry:?} in {ROUTES_ENVIRONMENT_VARIABLE}, \
-                 expected the form hostname=address"
+                 expected the form hostname=address or hostname=address!private"
             );
         };
-        proxy = proxy.route(hostname.trim(), upstream_address.trim());
+        let (upstream_address, access) = if let Some((address, access_tag)) =
+            address_and_access.split_once('!')
+        {
+            let access = match access_tag.trim() {
+                "private" => Access::Private,
+                "public" => Access::Public,
+                other => panic!("unknown access tag {other:?}, expected 'private' or 'public'"),
+            };
+            (address, access)
+        } else {
+            (address_and_access, Access::Public)
+        };
+        proxy = proxy.route(hostname.trim(), upstream_address.trim(), access);
     }
 
     for certificate_entry in certificates_specification

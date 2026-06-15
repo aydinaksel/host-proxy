@@ -10,7 +10,11 @@ let
   package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
   routesSpecification = lib.concatStringsSep "," (
     lib.mapAttrsToList (
-      hostname: upstreamAddress: "${hostname}=${upstreamAddress}"
+      hostname: route:
+        let
+          accessTag = if route.access == "private" then "!private" else "";
+        in
+        "${hostname}=${route.upstreamAddress}${accessTag}"
     ) hostProxyConfiguration.routes
   );
   certificatesSpecification = lib.concatStringsSep "," (
@@ -24,15 +28,31 @@ in
     enable = lib.mkEnableOption "the host reverse proxy on ports 80 and 443";
 
     routes = lib.mkOption {
-      type = lib.types.attrsOf lib.types.str;
+      type = lib.types.attrsOf (lib.types.submodule {
+        options = {
+          upstreamAddress = lib.mkOption {
+            type = lib.types.str;
+            description = "Address of the upstream server (host:port).";
+          };
+          access = lib.mkOption {
+            type = lib.types.enum [ "public" "private" ];
+            default = "public";
+            description = ''
+              Access control for this route. Public routes are reachable by
+              anyone. Private routes only accept connections from loopback,
+              RFC 1918, and Tailscale CGNAT addresses.
+            '';
+          };
+        };
+      });
       description = ''
-        Map from public hostname to local upstream address. Matching is
-        exact, so subdomains need their own entries. Requests for hosts
-        not listed here receive a 404.
+        Map from hostname to route configuration. Matching is exact, so
+        subdomains need their own entries. Requests for hosts not listed
+        here receive a 404.
       '';
       example = {
-        "example.org" = "127.0.0.1:3000";
-        "www.example.org" = "127.0.0.1:3000";
+        "example.org" = { upstreamAddress = "127.0.0.1:3000"; };
+        "admin.example.org" = { upstreamAddress = "127.0.0.1:4000"; access = "private"; };
       };
     };
 
