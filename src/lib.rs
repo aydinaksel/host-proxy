@@ -185,6 +185,7 @@ impl HostProxy {
                 upstream_addresses_by_hostname: self.upstream_addresses_by_hostname,
             },
         );
+        router_service.threads = Some(available_worker_thread_count());
 
         let mut tls_settings = pingora::listeners::tls::TlsSettings::intermediate(
             &first_certificate.certificate_path,
@@ -225,6 +226,12 @@ struct HostRouter {
 }
 
 struct RedirectToHttps;
+
+fn available_worker_thread_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+}
 
 fn requested_hostname(session: &Session) -> Option<String> {
     if let Some(authority) = session.req_header().uri.authority() {
