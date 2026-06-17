@@ -21,25 +21,30 @@ fn main() {
         .split(',')
         .filter(|route_entry| !route_entry.is_empty())
     {
-        let Some((hostname, address_and_access)) = route_entry.split_once('=') else {
+        let Some((hostname, target)) = route_entry.split_once('=') else {
             panic!(
                 "invalid route entry {route_entry:?} in {ROUTES_ENVIRONMENT_VARIABLE}, \
-                 expected the form hostname=address or hostname=address!private"
+                 expected hostname=address, hostname=address!private, or hostname=>redirecthost"
             );
         };
-        let (upstream_address, access) = if let Some((address, access_tag)) =
-            address_and_access.split_once('!')
-        {
-            let access = match access_tag.trim() {
-                "private" => Access::Private,
-                "public" => Access::Public,
-                other => panic!("unknown access tag {other:?}, expected 'private' or 'public'"),
-            };
-            (address, access)
+
+        proxy = if let Some(redirect_host) = target.strip_prefix('>') {
+            proxy.redirect(hostname.trim(), redirect_host.trim())
         } else {
-            (address_and_access, Access::Public)
+            let (upstream_address, access) = if let Some((address, access_tag)) =
+                target.split_once('!')
+            {
+                let access = match access_tag.trim() {
+                    "private" => Access::Private,
+                    "public" => Access::Public,
+                    other => panic!("unknown access tag {other:?}, expected 'private' or 'public'"),
+                };
+                (address, access)
+            } else {
+                (target, Access::Public)
+            };
+            proxy.route(hostname.trim(), upstream_address.trim(), access)
         };
-        proxy = proxy.route(hostname.trim(), upstream_address.trim(), access);
     }
 
     for certificate_entry in certificates_specification

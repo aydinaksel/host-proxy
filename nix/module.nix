@@ -11,10 +11,13 @@ let
   routesSpecification = lib.concatStringsSep "," (
     lib.mapAttrsToList (
       hostname: route:
-        let
-          accessTag = if route.access == "private" then "!private" else "";
-        in
-        "${hostname}=${route.upstreamAddress}${accessTag}"
+        if route.redirectTo != null then
+          "${hostname}=>${route.redirectTo}"
+        else
+          let
+            accessTag = if route.access == "private" then "!private" else "";
+          in
+          "${hostname}=${route.upstreamAddress}${accessTag}"
     ) hostProxyConfiguration.routes
   );
   certificatesSpecification = lib.concatStringsSep "," (
@@ -31,16 +34,31 @@ in
       type = lib.types.attrsOf (lib.types.submodule {
         options = {
           upstreamAddress = lib.mkOption {
-            type = lib.types.str;
-            description = "Address of the upstream server (host:port).";
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = ''
+              Address of the upstream server (host:port). Mutually exclusive
+              with redirectTo; set exactly one per route.
+            '';
+          };
+          redirectTo = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = ''
+              Permanently redirect (301) requests for this hostname to
+              https://<redirectTo><path>. The target is fixed configuration, so
+              it cannot become an open redirect. TLS still terminates here, so a
+              certificate covering this hostname is required. Mutually exclusive
+              with upstreamAddress.
+            '';
           };
           access = lib.mkOption {
             type = lib.types.enum [ "public" "private" ];
             default = "public";
             description = ''
-              Access control for this route. Public routes are reachable by
+              Access control for a proxied route. Public routes are reachable by
               anyone. Private routes only accept connections from loopback,
-              RFC 1918, and Tailscale CGNAT addresses.
+              RFC 1918, and Tailscale CGNAT addresses. Ignored for redirects.
             '';
           };
         };
@@ -84,6 +102,14 @@ in
   };
 
   config = lib.mkIf hostProxyConfiguration.enable {
+    assertions = lib.mapAttrsToList (hostname: route: {
+      assertion = (route.upstreamAddress != null) != (route.redirectTo != null);
+      message = ''
+        services.hostProxy.routes."${hostname}" must set exactly one of
+        upstreamAddress or redirectTo.
+      '';
+    }) hostProxyConfiguration.routes;
+
     users.users.host-proxy = {
       isSystemUser = true;
       group = "host-proxy";

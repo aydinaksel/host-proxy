@@ -131,9 +131,14 @@ impl CertificateResolver {
     }
 }
 
-struct Route {
-    upstream_address: String,
-    access: Access,
+enum Route {
+    Proxy {
+        upstream_address: String,
+        access: Access,
+    },
+    Redirect {
+        target_host: String,
+    },
 }
 
 pub struct HostProxy {
@@ -157,9 +162,27 @@ impl HostProxy {
     ) -> Self {
         self.routes_by_hostname.insert(
             hostname.into().to_ascii_lowercase(),
-            Route {
+            Route::Proxy {
                 upstream_address: upstream_address.into(),
                 access,
+            },
+        );
+        self
+    }
+
+    /// Permanently redirect (301) requests for `hostname` to
+    /// `https://{target_host}{path_and_query}`. The target is fixed
+    /// configuration and is never taken from the request, so this cannot
+    /// become an open redirect.
+    pub fn redirect(
+        mut self,
+        hostname: impl Into<String>,
+        target_host: impl Into<String>,
+    ) -> Self {
+        self.routes_by_hostname.insert(
+            hostname.into().to_ascii_lowercase(),
+            Route::Redirect {
+                target_host: target_host.into(),
             },
         );
         self
@@ -179,18 +202,31 @@ impl HostProxy {
         }
 
         for (hostname, route) in &self.routes_by_hostname {
-            let access_label = match route.access {
-                Access::Public => "public",
-                Access::Private => "private",
-            };
-            event!(
-                name: "proxy.route.configured",
-                Level::INFO,
-                server.address = hostname,
-                upstream.address = route.upstream_address,
-                route.access = access_label,
-                "routing {{server.address}} to {{upstream.address}} ({{route.access}})",
-            );
+            match route {
+                Route::Proxy { upstream_address, access } => {
+                    let access_label = match access {
+                        Access::Public => "public",
+                        Access::Private => "private",
+                    };
+                    event!(
+                        name: "proxy.route.configured",
+                        Level::INFO,
+                        server.address = hostname,
+                        upstream.address = upstream_address,
+                        route.access = access_label,
+                        "routing {{server.address}} to {{upstream.address}} ({{route.access}})",
+                    );
+                }
+                Route::Redirect { target_host } => {
+                    event!(
+                        name: "proxy.redirect.configured",
+                        Level::INFO,
+                        server.address = hostname,
+                        redirect.target = target_host,
+                        "redirecting {{server.address}} to https://{{redirect.target}}",
+                    );
+                }
+            }
         }
 
         let mut contexts_by_hostname = HashMap::new();
@@ -271,6 +307,25 @@ fn available_worker_thread_count() -> usize {
         .unwrap_or(1)
 }
 
+async fn write_permanent_redirect(session: &mut Session, location: String) -> Result<()> {
+    let mut response_header = ResponseHeader::build(301, None)?;
+    response_header.insert_header("Location", location)?;
+    response_header.insert_header("Content-Length", "0")?;
+    session
+        .write_response_header(Box::new(response_header), true)
+        .await?;
+    Ok(())
+}
+
+fn requested_path_and_query(session: &Session) -> &str {
+    session
+        .req_header()
+        .uri
+        .path_and_query()
+        .map(|path_and_query| path_and_query.as_str())
+        .unwrap_or("/")
+}
+
 fn requested_hostname(session: &Session) -> Option<String> {
     if let Some(authority) = session.req_header().uri.authority() {
         return Some(authority.host().to_ascii_lowercase());
@@ -320,7 +375,17 @@ impl ProxyHttp for HostRouter {
             return Ok(true);
         };
 
-        if route.access == Access::Private {
+        let (upstream_address, access) = match route {
+            Route::Redirect { target_host } => {
+                let redirect_location =
+                    format!("https://{target_host}{}", requested_path_and_query(session));
+                write_permanent_redirect(session, redirect_location).await?;
+                return Ok(true);
+            }
+            Route::Proxy { upstream_address, access } => (upstream_address, *access),
+        };
+
+        if access == Access::Private {
             let client_address_string = session
                 .client_addr()
                 .map(|address| address.to_string())
@@ -347,7 +412,7 @@ impl ProxyHttp for HostRouter {
             }
         }
 
-        *routed_upstream_address = Some(route.upstream_address.clone());
+        *routed_upstream_address = Some(upstream_address.clone());
         Ok(false)
     }
 
@@ -401,20 +466,9 @@ impl ProxyHttp for RedirectToHttps {
             return Ok(true);
         };
 
-        let path_and_query = session
-            .req_header()
-            .uri
-            .path_and_query()
-            .map(|path_and_query| path_and_query.as_str())
-            .unwrap_or("/");
-
-        let redirect_location = format!("https://{hostname}{path_and_query}");
-        let mut response_header = ResponseHeader::build(301, None)?;
-        response_header.insert_header("Location", redirect_location)?;
-        response_header.insert_header("Content-Length", "0")?;
-        session
-            .write_response_header(Box::new(response_header), true)
-            .await?;
+        let redirect_location =
+            format!("https://{hostname}{}", requested_path_and_query(session));
+        write_permanent_redirect(session, redirect_location).await?;
         Ok(true)
     }
 
