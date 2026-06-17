@@ -10,7 +10,7 @@ use pingora::proxy::{ProxyHttp, Session};
 use pingora::tls::nid::Nid;
 use pingora::tls::pkey::PKey;
 use pingora::tls::ssl::{
-    AlpnError, NameType, SslContext, SslMethod, SslRef, select_next_proto,
+    AlpnError, NameType, SslContext, SslMethod, SslRef, SslVersion, select_next_proto,
 };
 use pingora::tls::x509::X509;
 use pingora::{Error, ErrorType};
@@ -73,6 +73,12 @@ impl Certificate {
 
         let mut context_builder = SslContext::builder(SslMethod::tls())
             .expect("failed to create SSL context builder");
+        // Pin the same TLS 1.2+ floor the port-443 base listener gets from
+        // TlsSettings::intermediate, so SNI-matched connections are not weaker
+        // than the no-SNI fallback.
+        context_builder
+            .set_min_proto_version(Some(SslVersion::TLS1_2))
+            .expect("failed to set minimum TLS version on SSL context");
         context_builder
             .set_certificate(&x509)
             .expect("failed to set certificate on SSL context");
