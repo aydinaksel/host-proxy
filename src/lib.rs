@@ -39,6 +39,53 @@ fn is_private_client(address: IpAddr) -> bool {
     }
 }
 
+/// Bearer tokens accepted on a route, loaded once at startup. Holding several
+/// lets a token be rotated by adding the new one, redeploying every client, and
+/// only then removing the old one.
+pub struct BearerTokens {
+    tokens: Vec<String>,
+}
+
+impl BearerTokens {
+    fn load(token_file_path: &str) -> Self {
+        let contents = fs::read_to_string(token_file_path).unwrap_or_else(|error| {
+            panic!("failed to read bearer token file {token_file_path}: {error}")
+        });
+
+        let tokens: Vec<String> = contents
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+
+        if tokens.is_empty() {
+            panic!("bearer token file {token_file_path} contains no tokens");
+        }
+
+        BearerTokens { tokens }
+    }
+
+    fn accepts(&self, presented_token: &str) -> bool {
+        // fold rather than any: any short-circuits on the first match, which
+        // would leak through timing which of the accepted tokens was presented.
+        self.tokens.iter().fold(false, |accepted, token| {
+            constant_time_equals(token.as_bytes(), presented_token.as_bytes()) || accepted
+        })
+    }
+}
+
+fn constant_time_equals(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let mut difference = 0u8;
+    for (left_byte, right_byte) in left.iter().zip(right.iter()) {
+        difference |= left_byte ^ right_byte;
+    }
+    difference == 0
+}
+
 pub struct Certificate {
     certificate_path: String,
     private_key_path: String,
@@ -141,6 +188,7 @@ enum Route {
     Proxy {
         upstream_address: String,
         access: Access,
+        bearer_tokens: Option<BearerTokens>,
     },
     Redirect {
         target_host: String,
@@ -171,6 +219,29 @@ impl HostProxy {
             Route::Proxy {
                 upstream_address: upstream_address.into(),
                 access,
+                bearer_tokens: None,
+            },
+        );
+        self
+    }
+
+    /// Route requests only when they carry `Authorization: Bearer <token>` with
+    /// a token listed in `token_file_path`, one per line. Unauthenticated
+    /// requests receive a 401 and never reach the upstream, so this suits
+    /// machine-to-machine endpoints that must be publicly reachable.
+    pub fn authenticated_route(
+        mut self,
+        hostname: impl Into<String>,
+        upstream_address: impl Into<String>,
+        access: Access,
+        token_file_path: &str,
+    ) -> Self {
+        self.routes_by_hostname.insert(
+            hostname.into().to_ascii_lowercase(),
+            Route::Proxy {
+                upstream_address: upstream_address.into(),
+                access,
+                bearer_tokens: Some(BearerTokens::load(token_file_path)),
             },
         );
         self
@@ -209,7 +280,7 @@ impl HostProxy {
 
         for (hostname, route) in &self.routes_by_hostname {
             match route {
-                Route::Proxy { upstream_address, access } => {
+                Route::Proxy { upstream_address, access, bearer_tokens } => {
                     let access_label = match access {
                         Access::Public => "public",
                         Access::Private => "private",
@@ -220,7 +291,8 @@ impl HostProxy {
                         server.address = hostname,
                         upstream.address = upstream_address,
                         route.access = access_label,
-                        "routing {{server.address}} to {{upstream.address}} ({{route.access}})",
+                        route.authenticated = bearer_tokens.is_some(),
+                        "routing {{server.address}} to {{upstream.address}} ({{route.access}}, authenticated={{route.authenticated}})",
                     );
                 }
                 Route::Redirect { target_host } => {
@@ -323,6 +395,16 @@ async fn write_permanent_redirect(session: &mut Session, location: String) -> Re
     Ok(())
 }
 
+async fn write_unauthorized(session: &mut Session) -> Result<()> {
+    let mut response_header = ResponseHeader::build(401, None)?;
+    response_header.insert_header("WWW-Authenticate", "Bearer")?;
+    response_header.insert_header("Content-Length", "0")?;
+    session
+        .write_response_header(Box::new(response_header), true)
+        .await?;
+    Ok(())
+}
+
 fn requested_path_and_query(session: &Session) -> &str {
     session
         .req_header()
@@ -381,14 +463,16 @@ impl ProxyHttp for HostRouter {
             return Ok(true);
         };
 
-        let (upstream_address, access) = match route {
+        let (upstream_address, access, bearer_tokens) = match route {
             Route::Redirect { target_host } => {
                 let redirect_location =
                     format!("https://{target_host}{}", requested_path_and_query(session));
                 write_permanent_redirect(session, redirect_location).await?;
                 return Ok(true);
             }
-            Route::Proxy { upstream_address, access } => (upstream_address, *access),
+            Route::Proxy { upstream_address, access, bearer_tokens } => {
+                (upstream_address, *access, bearer_tokens.as_ref())
+            }
         };
 
         if access == Access::Private {
@@ -414,6 +498,31 @@ impl ProxyHttp for HostRouter {
                     "denied public access to private route {{server.address}} from {{client.address}}",
                 );
                 session.respond_error(403).await?;
+                return Ok(true);
+            }
+        }
+
+        if let Some(accepted_tokens) = bearer_tokens {
+            let presented_token = session
+                .req_header()
+                .headers
+                .get("authorization")
+                .and_then(|header_value| header_value.to_str().ok())
+                .and_then(|header_value| header_value.strip_prefix("Bearer "));
+
+            let is_authenticated = presented_token
+                .map(|token| accepted_tokens.accepts(token.trim()))
+                .unwrap_or(false);
+
+            if !is_authenticated {
+                event!(
+                    name: "proxy.route.unauthenticated",
+                    Level::WARN,
+                    server.address = hostname,
+                    url.path = session.req_header().uri.path(),
+                    "rejected unauthenticated request for {{server.address}}{{url.path}}",
+                );
+                write_unauthorized(session).await?;
                 return Ok(true);
             }
         }
@@ -487,5 +596,41 @@ impl ProxyHttp for RedirectToHttps {
             ErrorType::InternalError,
             "the redirect service never proxies upstream",
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BearerTokens, constant_time_equals};
+
+    fn tokens(values: &[&str]) -> BearerTokens {
+        BearerTokens {
+            tokens: values.iter().map(|value| value.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn constant_time_equals_matches_only_identical_slices() {
+        assert!(constant_time_equals(b"secret", b"secret"));
+        assert!(!constant_time_equals(b"secret", b"secrey"));
+        assert!(!constant_time_equals(b"secret", b"secre"));
+        assert!(!constant_time_equals(b"", b"a"));
+        assert!(constant_time_equals(b"", b""));
+    }
+
+    #[test]
+    fn accepts_any_configured_token() {
+        let accepted = tokens(&["first-token", "second-token"]);
+        assert!(accepted.accepts("first-token"));
+        assert!(accepted.accepts("second-token"));
+    }
+
+    #[test]
+    fn rejects_unknown_and_partial_tokens() {
+        let accepted = tokens(&["first-token"]);
+        assert!(!accepted.accepts("wrong-token"));
+        assert!(!accepted.accepts("first"));
+        assert!(!accepted.accepts("first-token-extra"));
+        assert!(!accepted.accepts(""));
     }
 }

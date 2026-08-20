@@ -16,8 +16,10 @@ let
         else
           let
             accessTag = if route.access == "private" then "!private" else "";
+            bearerTag =
+              if route.bearerTokenFile != null then "!bearer=${route.bearerTokenFile}" else "";
           in
-          "${hostname}=${route.upstreamAddress}${accessTag}"
+          "${hostname}=${route.upstreamAddress}${accessTag}${bearerTag}"
     ) hostProxyConfiguration.routes
   );
   certificatesSpecification = lib.concatStringsSep "," (
@@ -59,6 +61,18 @@ in
               Access control for a proxied route. Public routes are reachable by
               anyone. Private routes only accept connections from loopback,
               RFC 1918, and Tailscale CGNAT addresses. Ignored for redirects.
+            '';
+          };
+          bearerTokenFile = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = ''
+              Path to a file of accepted bearer tokens, one per line. When set,
+              requests must carry a matching Authorization: Bearer header or
+              receive a 401 without reaching the upstream. Listing several
+              tokens allows rotation without downtime. The file is read once at
+              startup, so changing it requires restarting the service. Ignored
+              for redirects.
             '';
           };
         };
@@ -107,6 +121,13 @@ in
       message = ''
         services.hostProxy.routes."${hostname}" must set exactly one of
         upstreamAddress or redirectTo.
+      '';
+    }) hostProxyConfiguration.routes
+    ++ lib.mapAttrsToList (hostname: route: {
+      assertion = route.bearerTokenFile == null || route.redirectTo == null;
+      message = ''
+        services.hostProxy.routes."${hostname}" sets bearerTokenFile on a
+        redirect, which is never authenticated. Remove one of them.
       '';
     }) hostProxyConfiguration.routes;
 
