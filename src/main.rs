@@ -5,6 +5,7 @@ use host_proxy::{Access, Certificate, HostProxy};
 const ROUTES_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_ROUTES";
 const CERTIFICATES_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_CERTIFICATES";
 const RATE_LIMIT_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_RATE_LIMIT_PER_SECOND";
+const METRICS_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_METRICS_ADDRESS";
 
 fn required_environment_variable(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| panic!("environment variable {name} is required"))
@@ -30,6 +31,10 @@ fn main() {
             )
         });
         proxy = proxy.rate_limit_per_second(max_requests_per_second);
+    }
+
+    if let Some(metrics_address) = optional_environment_variable(METRICS_ENVIRONMENT_VARIABLE) {
+        proxy = proxy.metrics_address(metrics_address);
     }
 
     for route_entry in route_specification

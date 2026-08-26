@@ -21,6 +21,7 @@ use pingora::tls::ssl::{
 use pingora::tls::x509::X509;
 use pingora::{Error, ErrorType};
 use pingora_limits::rate::Rate;
+use prometheus::{IntCounter, IntCounterVec};
 use tracing::{Level, event};
 
 const NEGOTIATED_ALPN_PROTOCOLS: &[u8] = b"\x02h2\x08http/1.1";
@@ -161,6 +162,31 @@ fn constant_time_equals(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
+const UNROUTED_HOSTNAME_LABEL: &str = "unrouted";
+
+struct RequestMetrics {
+    requests_total: IntCounterVec,
+    rate_limited_total: IntCounter,
+}
+
+impl RequestMetrics {
+    fn register() -> Self {
+        RequestMetrics {
+            requests_total: prometheus::register_int_counter_vec!(
+                "host_proxy_http_requests_total",
+                "Requests handled by the router, by routed hostname and response status",
+                &["hostname", "status"]
+            )
+            .expect("failed to register the request counter"),
+            rate_limited_total: prometheus::register_int_counter!(
+                "host_proxy_rate_limited_requests_total",
+                "Requests rejected with 429 by the per-client rate limit"
+            )
+            .expect("failed to register the rate limit counter"),
+        }
+    }
+}
+
 struct RateLimit {
     requests_per_second_by_client: Rate,
     max_requests_per_second: isize,
@@ -295,6 +321,7 @@ pub struct HostProxy {
     routes_by_hostname: HashMap<String, Route>,
     certificates: Vec<Certificate>,
     rate_limit_per_second: Option<u32>,
+    metrics_address: Option<String>,
 }
 
 impl HostProxy {
@@ -303,7 +330,16 @@ impl HostProxy {
             routes_by_hostname: HashMap::new(),
             certificates: Vec::new(),
             rate_limit_per_second: None,
+            metrics_address: None,
         }
+    }
+
+    /// Serve Prometheus metrics over HTTP on this address. Bind it to
+    /// loopback or a private interface; the endpoint carries no
+    /// authentication of its own.
+    pub fn metrics_address(mut self, metrics_address: impl Into<String>) -> Self {
+        self.metrics_address = Some(metrics_address.into());
+        self
     }
 
     /// Reject clients exceeding this many requests per second, per client IP
@@ -454,6 +490,7 @@ impl HostProxy {
             HostRouter {
                 routes_by_hostname: self.routes_by_hostname,
                 rate_limit: self.rate_limit_per_second.map(RateLimit::new),
+                request_metrics: RequestMetrics::register(),
             },
         );
         router_service.threads = Some(available_worker_thread_count());
@@ -478,6 +515,19 @@ impl HostProxy {
 
         server.add_service(router_service);
         server.add_service(redirect_service);
+
+        if let Some(metrics_address) = &self.metrics_address {
+            let mut metrics_service =
+                pingora::services::listening::Service::prometheus_http_service();
+            metrics_service.add_tcp(metrics_address);
+            server.add_service(metrics_service);
+            event!(
+                name: "proxy.metrics.configured",
+                Level::INFO,
+                server.address = metrics_address,
+                "serving Prometheus metrics on {{server.address}}",
+            );
+        }
 
         spawn_token_reload_signal_handler(reloadable_tokens);
 
@@ -518,6 +568,13 @@ fn build_tls_settings(
 struct HostRouter {
     routes_by_hostname: HashMap<String, Route>,
     rate_limit: Option<RateLimit>,
+    request_metrics: RequestMetrics,
+}
+
+#[derive(Default)]
+pub struct RequestContext {
+    routed_hostname: Option<String>,
+    upstream_address: Option<String>,
 }
 
 struct RedirectToHttps;
@@ -595,21 +652,22 @@ fn requested_hostname(session: &Session) -> Option<String> {
 
 #[async_trait]
 impl ProxyHttp for HostRouter {
-    type CTX = Option<String>;
+    type CTX = RequestContext;
 
     fn new_ctx(&self) -> Self::CTX {
-        None
+        RequestContext::default()
     }
 
     async fn request_filter(
         &self,
         session: &mut Session,
-        routed_upstream_address: &mut Self::CTX,
+        context: &mut Self::CTX,
     ) -> Result<bool> {
         if let (Some(rate_limit), Some(client_address)) =
             (&self.rate_limit, client_ip_address(session))
         {
             if rate_limit.exceeded_by(client_address) {
+                self.request_metrics.rate_limited_total.inc();
                 event!(
                     name: "proxy.request.rate_limited",
                     Level::WARN,
@@ -637,6 +695,8 @@ impl ProxyHttp for HostRouter {
             session.respond_error(404).await?;
             return Ok(true);
         };
+
+        context.routed_hostname = Some(hostname.clone());
 
         let (upstream_address, access, bearer_tokens) = match route {
             Route::Redirect { target_host } => {
@@ -694,16 +754,16 @@ impl ProxyHttp for HostRouter {
             }
         }
 
-        *routed_upstream_address = Some(upstream_address.clone());
+        context.upstream_address = Some(upstream_address.clone());
         Ok(false)
     }
 
     async fn upstream_peer(
         &self,
         _session: &mut Session,
-        routed_upstream_address: &mut Self::CTX,
+        context: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let upstream_address = routed_upstream_address.clone().ok_or_else(|| {
+        let upstream_address = context.upstream_address.clone().ok_or_else(|| {
             Error::explain(
                 ErrorType::InternalError,
                 "upstream requested for a session that request_filter did not route",
@@ -722,13 +782,46 @@ impl ProxyHttp for HostRouter {
         &self,
         session: &mut Session,
         upstream_request: &mut RequestHeader,
-        _routed_upstream_address: &mut Self::CTX,
+        _context: &mut Self::CTX,
     ) -> Result<()> {
         if let Some(client_address) = client_ip_address(session) {
             upstream_request.insert_header("X-Forwarded-For", client_address.to_string())?;
         }
         upstream_request.insert_header("X-Forwarded-Proto", "https")?;
         Ok(())
+    }
+
+    async fn logging(&self, session: &mut Session, error: Option<&Error>, context: &mut Self::CTX)
+    where
+        Self::CTX: Send + Sync,
+    {
+        let status_code = session
+            .response_written()
+            .map(|response_header| response_header.status.as_u16())
+            .unwrap_or(0);
+        let hostname = context
+            .routed_hostname
+            .as_deref()
+            .unwrap_or(UNROUTED_HOSTNAME_LABEL);
+
+        self.request_metrics
+            .requests_total
+            .with_label_values(&[hostname, &status_code.to_string()])
+            .inc();
+
+        event!(
+            name: "proxy.request.completed",
+            Level::INFO,
+            http.request.method = session.req_header().method.as_str(),
+            server.address = hostname,
+            url.path = session.req_header().uri.path(),
+            http.response.status_code = status_code,
+            client.address = client_ip_address(session)
+                .map(|address| address.to_string())
+                .unwrap_or_default(),
+            error.message = error.map(|error| error.to_string()).unwrap_or_default(),
+            "{{http.request.method}} {{server.address}}{{url.path}} responded {{http.response.status_code}}",
+        );
     }
 }
 

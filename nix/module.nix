@@ -119,6 +119,17 @@ in
       '';
     };
 
+    metricsAddress = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "127.0.0.1:9184";
+      description = ''
+        Address (host:port) to serve Prometheus metrics on. The endpoint
+        carries no authentication of its own, so bind it to loopback or a
+        private interface. Null disables the metrics listener.
+      '';
+    };
+
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = true;
@@ -165,6 +176,8 @@ in
         RUST_LOG = "info";
       } // lib.optionalAttrs (hostProxyConfiguration.rateLimitPerSecond != null) {
         HOST_PROXY_RATE_LIMIT_PER_SECOND = toString hostProxyConfiguration.rateLimitPerSecond;
+      } // lib.optionalAttrs (hostProxyConfiguration.metricsAddress != null) {
+        HOST_PROXY_METRICS_ADDRESS = hostProxyConfiguration.metricsAddress;
       };
 
       serviceConfig = {

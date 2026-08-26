@@ -59,6 +59,14 @@ The `host-proxy` binary reads two environment variables:
     accepted from a single client IP address. Clients over the limit receive a
     429 with `Retry-After: 1` before any routing or authentication work
     happens. Unset means no rate limiting; the NixOS module defaults to 100.
+-   `HOST_PROXY_METRICS_ADDRESS` (optional): `host:port` to serve Prometheus
+    metrics on, e.g. `127.0.0.1:9184`. The endpoint carries no authentication
+    of its own, so bind it to loopback or a private interface. Alongside the
+    process metrics, `host_proxy_http_requests_total` counts requests by
+    routed hostname and response status, and
+    `host_proxy_rate_limited_requests_total` counts 429s from the rate limit.
+    Every request is also logged as a structured `proxy.request.completed`
+    event with method, hostname, path, status, and client address.
 
 ## Library
 

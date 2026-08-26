@@ -769,6 +769,7 @@ dependencies = [
  "async-trait",
  "pingora",
  "pingora-limits",
+ "prometheus",
  "signal-hook",
  "tracing",
  "tracing-subscriber",
