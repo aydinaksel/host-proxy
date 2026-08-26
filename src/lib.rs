@@ -2,15 +2,15 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
-use std::thread;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use signal_hook::consts::SIGHUP;
-use signal_hook::iterator::Signals;
 use pingora::http::ResponseHeader;
 use pingora::listeners::TcpSocketOptions;
 use pingora::listeners::tls::TlsSettings;
+use pingora::server::ShutdownWatch;
+use pingora::server::configuration::Opt;
+use pingora::services::background::{BackgroundService, background_service};
 use pingora::prelude::*;
 use pingora::proxy::{ProxyHttp, Session};
 use pingora::tls::nid::Nid;
@@ -134,20 +134,32 @@ impl BearerTokens {
     }
 }
 
-fn spawn_token_reload_signal_handler(reloadable_tokens: Vec<BearerTokens>) {
-    let mut signals = Signals::new([SIGHUP]).expect("failed to register SIGHUP handler");
-    thread::spawn(move || {
-        for _signal in signals.forever() {
-            event!(
-                name: "proxy.tokens.reload_requested",
-                Level::INFO,
-                "received SIGHUP, reloading bearer tokens",
-            );
-            for tokens in &reloadable_tokens {
-                tokens.reload();
+struct TokenReloadService {
+    reloadable_tokens: Vec<BearerTokens>,
+}
+
+#[async_trait]
+impl BackgroundService for TokenReloadService {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        let mut hangup_signals =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .expect("failed to register SIGHUP handler");
+        loop {
+            tokio::select! {
+                _ = hangup_signals.recv() => {
+                    event!(
+                        name: "proxy.tokens.reload_requested",
+                        Level::INFO,
+                        "received SIGHUP, reloading bearer tokens",
+                    );
+                    for tokens in &self.reloadable_tokens {
+                        tokens.reload();
+                    }
+                }
+                _ = shutdown.changed() => return,
             }
         }
-    });
+    }
 }
 
 fn constant_time_equals(left: &[u8], right: &[u8]) -> bool {
@@ -482,7 +494,8 @@ impl HostProxy {
             contexts_by_hostname,
         });
 
-        let mut server = Server::new(None).expect("failed to create pingora server");
+        let mut server =
+            Server::new(Some(Opt::parse_args())).expect("failed to create pingora server");
         server.bootstrap();
 
         let mut router_service = http_proxy_service(
@@ -529,7 +542,10 @@ impl HostProxy {
             );
         }
 
-        spawn_token_reload_signal_handler(reloadable_tokens);
+        server.add_service(background_service(
+            "bearer token reload",
+            TokenReloadService { reloadable_tokens },
+        ));
 
         server.run_forever();
     }

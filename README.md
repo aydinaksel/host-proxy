@@ -29,7 +29,7 @@ A route is one of:
     and answers 401 otherwise. Tokens are compared in constant time and the file
     may list several, so a token can be rotated by adding the replacement,
     moving every client over, and only then removing the old one. The file is
-    reloaded on `SIGHUP` (`systemctl reload host-proxy`), so token changes take
+    re-read on reload (see below) and on `SIGHUP`, so token changes take
     effect without dropping connections. Suits
     machine-to-machine endpoints that must be publicly reachable; access and
     authentication compose, so a route can require both.
@@ -121,3 +121,17 @@ services.hostProxy = {
 ```
 
 Each route sets exactly one of `upstreamAddress` or `redirectTo`.
+
+## Reloads and zero-downtime upgrades
+
+`systemctl reload host-proxy` performs a full zero-downtime replacement using
+Pingora's graceful upgrade: a new process starts, takes over the listening
+sockets from the old one, and the old process finishes its in-flight requests
+before exiting. No connection is dropped, and the new process picks up
+everything: a new binary, changed routes, renewed certificates, and rotated
+bearer tokens. The NixOS module marks the unit `reloadIfChanged`, so
+`nixos-rebuild switch` upgrades the running proxy the same way, and ACME's
+`reloadServices` picks up renewed certificates through it.
+
+Sending `SIGHUP` directly to the process re-reads only the bearer token files
+in place, without replacing the process.

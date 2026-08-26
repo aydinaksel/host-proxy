@@ -27,6 +27,12 @@ let
       certificate: "${certificate.certificateFile}:${certificate.privateKeyFile}"
     ) hostProxyConfiguration.certificates
   );
+  serverConfiguration = pkgs.writeText "host-proxy-server.yaml" ''
+    ---
+    version: 1
+    pid_file: /run/host-proxy/host-proxy.pid
+    upgrade_sock: /run/host-proxy/upgrade.sock
+  '';
 in
 {
   options.services.hostProxy = {
@@ -70,9 +76,10 @@ in
               Path to a file of accepted bearer tokens, one per line. When set,
               requests must carry a matching Authorization: Bearer header or
               receive a 401 without reaching the upstream. Listing several
-              tokens allows rotation without downtime. The file is reloaded when
-              the service receives SIGHUP, so `systemctl reload host-proxy`
-              picks up token changes without dropping connections. Ignored for
+              tokens allows rotation without downtime. `systemctl reload
+              host-proxy` hands the listening sockets to a fresh process that
+              re-reads the file, and SIGHUP re-reads it in place, so token
+              changes take effect without dropping connections. Ignored for
               redirects.
             '';
           };
@@ -169,6 +176,7 @@ in
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
+      reloadIfChanged = true;
 
       environment = {
         HOST_PROXY_ROUTES = routesSpecification;
@@ -181,8 +189,14 @@ in
       };
 
       serviceConfig = {
-        ExecStart = "${package}/bin/host-proxy";
-        ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
+        Type = "forking";
+        PIDFile = "/run/host-proxy/host-proxy.pid";
+        RuntimeDirectory = "host-proxy";
+        ExecStart = "${package}/bin/host-proxy --daemon --conf ${serverConfiguration}";
+        ExecReload = [
+          "${pkgs.coreutils}/bin/kill -QUIT $MAINPID"
+          "${package}/bin/host-proxy --upgrade --daemon --conf ${serverConfiguration}"
+        ];
         User = "host-proxy";
         Group = "host-proxy";
         Restart = "on-failure";
