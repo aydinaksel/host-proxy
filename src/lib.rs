@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fs;
 use std::net::IpAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -26,6 +27,27 @@ use tracing::{Level, event};
 
 const NEGOTIATED_ALPN_PROTOCOLS: &[u8] = b"\x02h2\x08http/1.1";
 
+#[derive(Debug)]
+pub struct HostProxyError {
+    message: String,
+}
+
+impl HostProxyError {
+    pub fn new(message: impl Into<String>) -> Self {
+        HostProxyError {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for HostProxyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HostProxyError {}
+
 const UPSTREAM_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(300);
 const UPSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -41,8 +63,8 @@ fn is_private_client(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(ipv4) => {
             // Tailscale CGNAT: 100.64.0.0/10
-            let octets = ipv4.octets();
-            let is_tailscale = octets[0] == 100 && (octets[1] & 0xC0) == 64;
+            let [first_octet, second_octet, _, _] = ipv4.octets();
+            let is_tailscale = first_octet == 100 && (second_octet & 0xC0) == 64;
 
             ipv4.is_loopback()
                 || ipv4.is_private()
@@ -54,7 +76,8 @@ fn is_private_client(address: IpAddr) -> bool {
             }
             // Unique local addresses: fc00::/7, which includes Tailscale's
             // fd7a:115c:a1e0::/48
-            let is_unique_local = (ipv6.segments()[0] & 0xfe00) == 0xfc00;
+            let [first_segment, ..] = ipv6.segments();
+            let is_unique_local = (first_segment & 0xfe00) == 0xfc00;
 
             ipv6.is_loopback() || is_unique_local
         }
@@ -89,21 +112,21 @@ fn read_tokens(token_file_path: &str) -> Result<Vec<String>, String> {
 }
 
 impl BearerTokens {
-    fn load(token_file_path: &str) -> Self {
+    fn load(token_file_path: &str) -> Result<Self, HostProxyError> {
         let tokens = read_tokens(token_file_path)
-            .unwrap_or_else(|error| panic!("failed to load bearer tokens: {error}"));
+            .map_err(|error| HostProxyError::new(format!("failed to load bearer tokens: {error}")))?;
 
-        BearerTokens {
+        Ok(BearerTokens {
             token_file_path: Arc::from(token_file_path),
             tokens: Arc::new(RwLock::new(tokens)),
-        }
+        })
     }
 
     fn reload(&self) {
         match read_tokens(&self.token_file_path) {
             Ok(reloaded_tokens) => {
                 let token_count = reloaded_tokens.len();
-                *self.tokens.write().expect("bearer token lock poisoned") = reloaded_tokens;
+                *self.tokens.write().unwrap_or_else(PoisonError::into_inner) = reloaded_tokens;
                 event!(
                     name: "proxy.tokens.reloaded",
                     Level::INFO,
@@ -125,7 +148,7 @@ impl BearerTokens {
     }
 
     fn accepts(&self, presented_token: &str) -> bool {
-        let tokens = self.tokens.read().expect("bearer token lock poisoned");
+        let tokens = self.tokens.read().unwrap_or_else(PoisonError::into_inner);
         // fold rather than any: any short-circuits on the first match, which
         // would leak through timing which of the accepted tokens was presented.
         tokens.iter().fold(false, |accepted, token| {
@@ -141,9 +164,16 @@ struct TokenReloadService {
 #[async_trait]
 impl BackgroundService for TokenReloadService {
     async fn start(&self, mut shutdown: ShutdownWatch) {
-        let mut hangup_signals =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-                .expect("failed to register SIGHUP handler");
+        let registration =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup());
+        let Ok(mut hangup_signals) = registration else {
+            event!(
+                name: "proxy.tokens.reload_unavailable",
+                Level::ERROR,
+                "failed to register the SIGHUP handler, bearer tokens will not reload in place",
+            );
+            return;
+        };
         loop {
             tokio::select! {
                 _ = hangup_signals.recv() => {
@@ -182,20 +212,24 @@ struct RequestMetrics {
 }
 
 impl RequestMetrics {
-    fn register() -> Self {
-        RequestMetrics {
+    fn register() -> Result<Self, HostProxyError> {
+        Ok(RequestMetrics {
             requests_total: prometheus::register_int_counter_vec!(
                 "host_proxy_http_requests_total",
                 "Requests handled by the router, by routed hostname and response status",
                 &["hostname", "status"]
             )
-            .expect("failed to register the request counter"),
+            .map_err(|error| {
+                HostProxyError::new(format!("failed to register the request counter: {error}"))
+            })?,
             rate_limited_total: prometheus::register_int_counter!(
                 "host_proxy_rate_limited_requests_total",
                 "Requests rejected with 429 by the per-client rate limit"
             )
-            .expect("failed to register the rate limit counter"),
-        }
+            .map_err(|error| {
+                HostProxyError::new(format!("failed to register the rate limit counter: {error}"))
+            })?,
+        })
     }
 }
 
@@ -208,7 +242,8 @@ impl RateLimit {
     fn new(max_requests_per_second: u32) -> Self {
         RateLimit {
             requests_per_second_by_client: Rate::new(Duration::from_secs(1)),
-            max_requests_per_second: max_requests_per_second as isize,
+            max_requests_per_second: isize::try_from(max_requests_per_second)
+                .unwrap_or(isize::MAX),
         }
     }
 
@@ -233,44 +268,66 @@ impl Certificate {
         }
     }
 
-    fn load(&self) -> LoadedCertificate {
-        let certificate_pem = fs::read(&self.certificate_path).unwrap_or_else(|error| {
-            panic!("failed to read {}: {error}", self.certificate_path)
-        });
-        let private_key_pem = fs::read(&self.private_key_path).unwrap_or_else(|error| {
-            panic!("failed to read {}: {error}", self.private_key_path)
-        });
+    fn load(&self) -> Result<LoadedCertificate, HostProxyError> {
+        let certificate_pem = fs::read(&self.certificate_path).map_err(|error| {
+            HostProxyError::new(format!("failed to read {}: {error}", self.certificate_path))
+        })?;
+        let private_key_pem = fs::read(&self.private_key_path).map_err(|error| {
+            HostProxyError::new(format!("failed to read {}: {error}", self.private_key_path))
+        })?;
 
-        let chain = X509::stack_from_pem(&certificate_pem).unwrap_or_else(|error| {
-            panic!("invalid certificate {}: {error}", self.certificate_path)
-        });
-        let x509 = chain
-            .first()
-            .expect("certificate file is empty")
-            .clone();
-        let private_key = PKey::private_key_from_pem(&private_key_pem).unwrap_or_else(|error| {
-            panic!("invalid private key {}: {error}", self.private_key_path)
-        });
+        let chain = X509::stack_from_pem(&certificate_pem).map_err(|error| {
+            HostProxyError::new(format!(
+                "invalid certificate {}: {error}",
+                self.certificate_path
+            ))
+        })?;
+        let mut chain_certificates = chain.into_iter();
+        let x509 = chain_certificates.next().ok_or_else(|| {
+            HostProxyError::new(format!("certificate file {} is empty", self.certificate_path))
+        })?;
+        let private_key = PKey::private_key_from_pem(&private_key_pem).map_err(|error| {
+            HostProxyError::new(format!(
+                "invalid private key {}: {error}",
+                self.private_key_path
+            ))
+        })?;
 
-        let mut context_builder = SslContext::builder(SslMethod::tls())
-            .expect("failed to create SSL context builder");
+        let mut context_builder = SslContext::builder(SslMethod::tls()).map_err(|error| {
+            HostProxyError::new(format!("failed to create an SSL context builder: {error}"))
+        })?;
         // Pin the same TLS 1.2+ floor the port-443 base listener gets from
         // TlsSettings::intermediate, so SNI-matched connections are not weaker
         // than the no-SNI fallback.
         context_builder
             .set_min_proto_version(Some(SslVersion::TLS1_2))
-            .expect("failed to set minimum TLS version on SSL context");
-        context_builder
-            .set_certificate(&x509)
-            .expect("failed to set certificate on SSL context");
-        for intermediate in chain.iter().skip(1) {
+            .map_err(|error| {
+                HostProxyError::new(format!(
+                    "failed to set the minimum TLS version on the SSL context: {error}"
+                ))
+            })?;
+        context_builder.set_certificate(&x509).map_err(|error| {
+            HostProxyError::new(format!(
+                "failed to set certificate {} on the SSL context: {error}",
+                self.certificate_path
+            ))
+        })?;
+        for intermediate in chain_certificates {
             context_builder
-                .add_extra_chain_cert(intermediate.clone())
-                .expect("failed to add intermediate certificate");
+                .add_extra_chain_cert(intermediate)
+                .map_err(|error| {
+                    HostProxyError::new(format!(
+                        "failed to add an intermediate certificate from {}: {error}",
+                        self.certificate_path
+                    ))
+                })?;
         }
-        context_builder
-            .set_private_key(&private_key)
-            .expect("failed to set private key on SSL context");
+        context_builder.set_private_key(&private_key).map_err(|error| {
+            HostProxyError::new(format!(
+                "failed to set private key {} on the SSL context: {error}",
+                self.private_key_path
+            ))
+        })?;
         context_builder.set_alpn_select_callback(|_ssl, client_protocols| {
             select_next_proto(NEGOTIATED_ALPN_PROTOCOLS, client_protocols)
                 .ok_or(AlpnError::NOACK)
@@ -295,10 +352,10 @@ impl Certificate {
             }
         }
 
-        LoadedCertificate {
+        Ok(LoadedCertificate {
             hostnames,
             ssl_context,
-        }
+        })
     }
 }
 
@@ -322,11 +379,44 @@ enum Route {
     Proxy {
         upstream_address: String,
         access: Access,
+        bearer_token_file_path: Option<String>,
+    },
+    Redirect {
+        target_host: String,
+    },
+}
+
+enum LoadedRoute {
+    Proxy {
+        upstream_address: String,
+        access: Access,
         bearer_tokens: Option<BearerTokens>,
     },
     Redirect {
         target_host: String,
     },
+}
+
+impl Route {
+    fn load(self) -> Result<LoadedRoute, HostProxyError> {
+        match self {
+            Route::Proxy {
+                upstream_address,
+                access,
+                bearer_token_file_path,
+            } => {
+                let bearer_tokens = bearer_token_file_path
+                    .map(|token_file_path| BearerTokens::load(&token_file_path))
+                    .transpose()?;
+                Ok(LoadedRoute::Proxy {
+                    upstream_address,
+                    access,
+                    bearer_tokens,
+                })
+            }
+            Route::Redirect { target_host } => Ok(LoadedRoute::Redirect { target_host }),
+        }
+    }
 }
 
 pub struct HostProxy {
@@ -372,7 +462,7 @@ impl HostProxy {
             Route::Proxy {
                 upstream_address: upstream_address.into(),
                 access,
-                bearer_tokens: None,
+                bearer_token_file_path: None,
             },
         );
         self
@@ -382,20 +472,21 @@ impl HostProxy {
     /// a token listed in `token_file_path`, one per line. Unauthenticated
     /// requests receive a 401 and never reach the upstream, so this suits
     /// machine-to-machine endpoints that must be publicly reachable. The file is
-    /// reloaded on SIGHUP, so tokens rotate without restarting the proxy.
+    /// read when [`HostProxy::run`] starts and reloaded on SIGHUP, so tokens
+    /// rotate without restarting the proxy.
     pub fn authenticated_route(
         mut self,
         hostname: impl Into<String>,
         upstream_address: impl Into<String>,
         access: Access,
-        token_file_path: &str,
+        token_file_path: impl Into<String>,
     ) -> Self {
         self.routes_by_hostname.insert(
             hostname.into().to_ascii_lowercase(),
             Route::Proxy {
                 upstream_address: upstream_address.into(),
                 access,
-                bearer_tokens: Some(BearerTokens::load(token_file_path)),
+                bearer_token_file_path: Some(token_file_path.into()),
             },
         );
         self
@@ -424,17 +515,16 @@ impl HostProxy {
         self
     }
 
-    pub fn run(self) -> ! {
+    pub fn run(self) -> Result<Infallible, HostProxyError> {
         if self.routes_by_hostname.is_empty() {
-            panic!("no routes configured");
-        }
-        if self.certificates.is_empty() {
-            panic!("no certificates configured");
+            return Err(HostProxyError::new("no routes configured"));
         }
 
-        for (hostname, route) in &self.routes_by_hostname {
-            match route {
-                Route::Proxy { upstream_address, access, bearer_tokens } => {
+        let mut loaded_routes_by_hostname = HashMap::new();
+        let mut reloadable_tokens = Vec::new();
+        for (hostname, route) in self.routes_by_hostname {
+            match &route {
+                Route::Proxy { upstream_address, access, bearer_token_file_path } => {
                     let access_label = match access {
                         Access::Public => "public",
                         Access::Private => "private",
@@ -445,7 +535,7 @@ impl HostProxy {
                         server.address = hostname,
                         upstream.address = upstream_address,
                         route.access = access_label,
-                        route.authenticated = bearer_tokens.is_some(),
+                        route.authenticated = bearer_token_file_path.is_some(),
                         "routing {{server.address}} to {{upstream.address}} ({{route.access}}, authenticated={{route.authenticated}})",
                     );
                 }
@@ -459,25 +549,22 @@ impl HostProxy {
                     );
                 }
             }
+
+            let loaded_route = route.load()?;
+            if let LoadedRoute::Proxy { bearer_tokens: Some(bearer_tokens), .. } = &loaded_route {
+                reloadable_tokens.push(bearer_tokens.clone());
+            }
+            loaded_routes_by_hostname.insert(hostname, loaded_route);
         }
 
-        let reloadable_tokens: Vec<BearerTokens> = self
-            .routes_by_hostname
-            .values()
-            .filter_map(|route| match route {
-                Route::Proxy {
-                    bearer_tokens: Some(bearer_tokens),
-                    ..
-                } => Some(bearer_tokens.clone()),
-                _ => None,
-            })
-            .collect();
+        let first_certificate = self
+            .certificates
+            .first()
+            .ok_or_else(|| HostProxyError::new("no certificates configured"))?;
 
         let mut contexts_by_hostname = HashMap::new();
-        let first_certificate = &self.certificates[0];
-
         for certificate in &self.certificates {
-            let loaded = certificate.load();
+            let loaded = certificate.load()?;
             let shared_context = Arc::new(loaded.ssl_context);
             for hostname in &loaded.hostnames {
                 event!(
@@ -494,16 +581,17 @@ impl HostProxy {
             contexts_by_hostname,
         });
 
-        let mut server =
-            Server::new(Some(Opt::parse_args())).expect("failed to create pingora server");
+        let mut server = Server::new(Some(Opt::parse_args())).map_err(|error| {
+            HostProxyError::new(format!("failed to create the pingora server: {error}"))
+        })?;
         server.bootstrap();
 
         let mut router_service = http_proxy_service(
             &server.configuration,
             HostRouter {
-                routes_by_hostname: self.routes_by_hostname,
+                routes_by_hostname: loaded_routes_by_hostname,
                 rate_limit: self.rate_limit_per_second.map(RateLimit::new),
-                request_metrics: RequestMetrics::register(),
+                request_metrics: RequestMetrics::register()?,
             },
         );
         router_service.threads = Some(available_worker_thread_count());
@@ -514,12 +602,12 @@ impl HostProxy {
         router_service.add_tls_with_settings(
             "0.0.0.0:443",
             None,
-            build_tls_settings(first_certificate, &resolver),
+            build_tls_settings(first_certificate, &resolver)?,
         );
         router_service.add_tls_with_settings(
             "[::]:443",
             Some(ipv6_only_options.clone()),
-            build_tls_settings(first_certificate, &resolver),
+            build_tls_settings(first_certificate, &resolver)?,
         );
 
         let mut redirect_service = http_proxy_service(&server.configuration, RedirectToHttps);
@@ -547,7 +635,7 @@ impl HostProxy {
             TokenReloadService { reloadable_tokens },
         ));
 
-        server.run_forever();
+        server.run_forever()
     }
 }
 
@@ -560,29 +648,36 @@ impl Default for HostProxy {
 fn build_tls_settings(
     first_certificate: &Certificate,
     resolver: &Arc<CertificateResolver>,
-) -> TlsSettings {
+) -> Result<TlsSettings, HostProxyError> {
     let mut tls_settings = TlsSettings::intermediate(
         &first_certificate.certificate_path,
         &first_certificate.private_key_path,
     )
-    .expect("failed to create TLS settings");
+    .map_err(|error| HostProxyError::new(format!("failed to create TLS settings: {error}")))?;
 
     let sni_resolver = Arc::clone(resolver);
     tls_settings.set_servername_callback(move |ssl: &mut SslRef, _| {
         if let Some(server_name) = ssl.servername(NameType::HOST_NAME) {
             if let Some(context) = sni_resolver.resolve(server_name) {
-                ssl.set_ssl_context(context).ok();
+                if let Err(error) = ssl.set_ssl_context(context) {
+                    event!(
+                        name: "proxy.tls.context_swap_failed",
+                        Level::ERROR,
+                        error.message = error.to_string(),
+                        "failed to set the SNI-resolved SSL context: {{error.message}}",
+                    );
+                }
             }
         }
         Ok(())
     });
 
     tls_settings.enable_h2();
-    tls_settings
+    Ok(tls_settings)
 }
 
 struct HostRouter {
-    routes_by_hostname: HashMap<String, Route>,
+    routes_by_hostname: HashMap<String, LoadedRoute>,
     rate_limit: Option<RateLimit>,
     request_metrics: RequestMetrics,
 }
@@ -715,13 +810,13 @@ impl ProxyHttp for HostRouter {
         context.routed_hostname = Some(hostname.clone());
 
         let (upstream_address, access, bearer_tokens) = match route {
-            Route::Redirect { target_host } => {
+            LoadedRoute::Redirect { target_host } => {
                 let redirect_location =
                     format!("https://{target_host}{}", requested_path_and_query(session));
                 write_permanent_redirect(session, redirect_location).await?;
                 return Ok(true);
             }
-            Route::Proxy { upstream_address, access, bearer_tokens } => {
+            LoadedRoute::Proxy { upstream_address, access, bearer_tokens } => {
                 (upstream_address, *access, bearer_tokens.as_ref())
             }
         };
@@ -955,7 +1050,7 @@ mod tests {
     #[test]
     fn reload_swaps_the_accepted_token_set() {
         let path = temporary_token_file("first-token\n", "reload-swap");
-        let accepted = BearerTokens::load(path.to_str().unwrap());
+        let accepted = BearerTokens::load(path.to_str().unwrap()).unwrap();
         assert!(accepted.accepts("first-token"));
 
         std::fs::write(&path, "second-token\n").unwrap();
@@ -964,19 +1059,19 @@ mod tests {
         assert!(accepted.accepts("second-token"));
         assert!(!accepted.accepts("first-token"));
 
-        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
     fn reload_keeps_existing_tokens_when_the_new_file_is_empty() {
         let path = temporary_token_file("only-token\n", "reload-empty");
-        let accepted = BearerTokens::load(path.to_str().unwrap());
+        let accepted = BearerTokens::load(path.to_str().unwrap()).unwrap();
 
         std::fs::write(&path, "\n   \n").unwrap();
         accepted.reload();
 
         assert!(accepted.accepts("only-token"));
 
-        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&path).unwrap();
     }
 }

@@ -74,9 +74,11 @@ The crate also exposes the proxy as a library, so a host that ever needs custom
 proxy logic can ship its own thin binary:
 
 ```rust
-use host_proxy::{Access, Certificate, HostProxy};
+use std::convert::Infallible;
 
-fn main() {
+use host_proxy::{Access, Certificate, HostProxy, HostProxyError};
+
+fn main() -> Result<Infallible, HostProxyError> {
     HostProxy::new()
         .route("example.org", "127.0.0.1:3000", Access::Public)
         .route("admin.example.org", "127.0.0.1:4000", Access::Private)
@@ -91,7 +93,7 @@ fn main() {
             "/var/lib/acme/example.org/fullchain.pem".to_string(),
             "/var/lib/acme/example.org/key.pem".to_string(),
         ))
-        .run();
+        .run()
 }
 ```
 
