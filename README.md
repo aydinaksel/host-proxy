@@ -68,35 +68,6 @@ The `host-proxy` binary reads two environment variables:
     Every request is also logged as a structured `proxy.request.completed`
     event with method, hostname, path, status, and client address.
 
-## Library
-
-The crate also exposes the proxy as a library, so a host that ever needs custom
-proxy logic can ship its own thin binary:
-
-```rust
-use std::convert::Infallible;
-
-use host_proxy::{Access, Certificate, HostProxy, HostProxyError};
-
-fn main() -> Result<Infallible, HostProxyError> {
-    HostProxy::new()
-        .route("example.org", "127.0.0.1:3000", Access::Public)
-        .route("admin.example.org", "127.0.0.1:4000", Access::Private)
-        .authenticated_route(
-            "ingest.example.org",
-            "127.0.0.1:5000",
-            Access::Public,
-            "/run/secrets/ingest-tokens",
-        )
-        .redirect("www.example.org", "example.org")
-        .certificate(Certificate::new(
-            "/var/lib/acme/example.org/fullchain.pem".to_string(),
-            "/var/lib/acme/example.org/key.pem".to_string(),
-        ))
-        .run()
-}
-```
-
 ## NixOS
 
 The flake exposes `nixosModules.default`:
