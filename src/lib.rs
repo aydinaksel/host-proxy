@@ -20,6 +20,7 @@ use pingora::tls::ssl::{
 };
 use pingora::tls::x509::X509;
 use pingora::{Error, ErrorType};
+use pingora_limits::rate::Rate;
 use tracing::{Level, event};
 
 const NEGOTIATED_ALPN_PROTOCOLS: &[u8] = b"\x02h2\x08http/1.1";
@@ -160,6 +161,27 @@ fn constant_time_equals(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
+struct RateLimit {
+    requests_per_second_by_client: Rate,
+    max_requests_per_second: isize,
+}
+
+impl RateLimit {
+    fn new(max_requests_per_second: u32) -> Self {
+        RateLimit {
+            requests_per_second_by_client: Rate::new(Duration::from_secs(1)),
+            max_requests_per_second: max_requests_per_second as isize,
+        }
+    }
+
+    fn exceeded_by(&self, client_address: IpAddr) -> bool {
+        let observed_requests = self
+            .requests_per_second_by_client
+            .observe(&client_address, 1);
+        observed_requests > self.max_requests_per_second
+    }
+}
+
 pub struct Certificate {
     certificate_path: String,
     private_key_path: String,
@@ -272,6 +294,7 @@ enum Route {
 pub struct HostProxy {
     routes_by_hostname: HashMap<String, Route>,
     certificates: Vec<Certificate>,
+    rate_limit_per_second: Option<u32>,
 }
 
 impl HostProxy {
@@ -279,7 +302,15 @@ impl HostProxy {
         HostProxy {
             routes_by_hostname: HashMap::new(),
             certificates: Vec::new(),
+            rate_limit_per_second: None,
         }
+    }
+
+    /// Reject clients exceeding this many requests per second, per client IP
+    /// address, with a 429 before any routing or authentication work happens.
+    pub fn rate_limit_per_second(mut self, max_requests_per_second: u32) -> Self {
+        self.rate_limit_per_second = Some(max_requests_per_second);
+        self
     }
 
     pub fn route(
@@ -422,6 +453,7 @@ impl HostProxy {
             &server.configuration,
             HostRouter {
                 routes_by_hostname: self.routes_by_hostname,
+                rate_limit: self.rate_limit_per_second.map(RateLimit::new),
             },
         );
         router_service.threads = Some(available_worker_thread_count());
@@ -485,6 +517,7 @@ fn build_tls_settings(
 
 struct HostRouter {
     routes_by_hostname: HashMap<String, Route>,
+    rate_limit: Option<RateLimit>,
 }
 
 struct RedirectToHttps;
@@ -498,6 +531,16 @@ fn available_worker_thread_count() -> usize {
 async fn write_permanent_redirect(session: &mut Session, location: String) -> Result<()> {
     let mut response_header = ResponseHeader::build(301, None)?;
     response_header.insert_header("Location", location)?;
+    response_header.insert_header("Content-Length", "0")?;
+    session
+        .write_response_header(Box::new(response_header), true)
+        .await?;
+    Ok(())
+}
+
+async fn write_too_many_requests(session: &mut Session) -> Result<()> {
+    let mut response_header = ResponseHeader::build(429, None)?;
+    response_header.insert_header("Retry-After", "1")?;
     response_header.insert_header("Content-Length", "0")?;
     session
         .write_response_header(Box::new(response_header), true)
@@ -563,6 +606,21 @@ impl ProxyHttp for HostRouter {
         session: &mut Session,
         routed_upstream_address: &mut Self::CTX,
     ) -> Result<bool> {
+        if let (Some(rate_limit), Some(client_address)) =
+            (&self.rate_limit, client_ip_address(session))
+        {
+            if rate_limit.exceeded_by(client_address) {
+                event!(
+                    name: "proxy.request.rate_limited",
+                    Level::WARN,
+                    client.address = client_address.to_string(),
+                    "rate limited {{client.address}}, responding 429",
+                );
+                write_too_many_requests(session).await?;
+                return Ok(true);
+            }
+        }
+
         let Some(hostname) = requested_hostname(session) else {
             session.respond_error(400).await?;
             return Ok(true);

@@ -109,6 +109,16 @@ in
       '';
     };
 
+    rateLimitPerSecond = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.positive;
+      default = 100;
+      description = ''
+        Maximum requests per second accepted from a single client IP
+        address before the proxy answers 429 without any routing or
+        authentication work. Set to null to disable rate limiting.
+      '';
+    };
+
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = true;
@@ -153,6 +163,8 @@ in
         HOST_PROXY_ROUTES = routesSpecification;
         HOST_PROXY_CERTIFICATES = certificatesSpecification;
         RUST_LOG = "info";
+      } // lib.optionalAttrs (hostProxyConfiguration.rateLimitPerSecond != null) {
+        HOST_PROXY_RATE_LIMIT_PER_SECOND = toString hostProxyConfiguration.rateLimitPerSecond;
       };
 
       serviceConfig = {

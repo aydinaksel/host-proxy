@@ -55,6 +55,10 @@ The `host-proxy` binary reads two environment variables:
     `example.org=127.0.0.1:3000,admin.example.org=127.0.0.1:4000!private,www.example.org=>example.org`
 -   `HOST_PROXY_CERTIFICATES`: comma-separated `certificate_path:private_key_path`
     pairs, one per certificate to load.
+-   `HOST_PROXY_RATE_LIMIT_PER_SECOND` (optional): maximum requests per second
+    accepted from a single client IP address. Clients over the limit receive a
+    429 with `Retry-After: 1` before any routing or authentication work
+    happens. Unset means no rate limiting; the NixOS module defaults to 100.
 
 ## Library
 
