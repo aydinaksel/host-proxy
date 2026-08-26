@@ -3,6 +3,7 @@ use std::fs;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use std::thread;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use signal_hook::consts::SIGHUP;
@@ -22,6 +23,11 @@ use pingora::{Error, ErrorType};
 use tracing::{Level, event};
 
 const NEGOTIATED_ALPN_PROTOCOLS: &[u8] = b"\x02h2\x08http/1.1";
+
+const UPSTREAM_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(300);
+const UPSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(300);
+const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Access {
@@ -646,7 +652,12 @@ impl ProxyHttp for HostRouter {
             )
         })?;
 
-        Ok(Box::new(HttpPeer::new(upstream_address, false, String::new())))
+        let mut peer = HttpPeer::new(upstream_address, false, String::new());
+        peer.options.connection_timeout = Some(UPSTREAM_CONNECTION_TIMEOUT);
+        peer.options.read_timeout = Some(UPSTREAM_READ_TIMEOUT);
+        peer.options.write_timeout = Some(UPSTREAM_WRITE_TIMEOUT);
+        peer.options.idle_timeout = Some(UPSTREAM_IDLE_TIMEOUT);
+        Ok(Box::new(peer))
     }
 
     async fn upstream_request_filter(
