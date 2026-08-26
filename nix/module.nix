@@ -142,7 +142,7 @@ in
       443
     ];
 
-    systemd.services.hostProxy = {
+    systemd.services.host-proxy = {
       description = "Host reverse proxy";
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
