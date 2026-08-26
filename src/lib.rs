@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::fs;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::thread;
 
 use async_trait::async_trait;
+use signal_hook::consts::SIGHUP;
+use signal_hook::iterator::Signals;
 use pingora::http::ResponseHeader;
 use pingora::prelude::*;
 use pingora::proxy::{ProxyHttp, Session};
@@ -39,39 +42,93 @@ fn is_private_client(address: IpAddr) -> bool {
     }
 }
 
-/// Bearer tokens accepted on a route, loaded once at startup. Holding several
-/// lets a token be rotated by adding the new one, redeploying every client, and
-/// only then removing the old one.
+/// Bearer tokens accepted on a route. Holding several lets a token be rotated
+/// by adding the new one, redeploying every client, and only then removing the
+/// old one. The set is reloaded from its file on SIGHUP, so rotation needs no
+/// restart and no dropped connections.
+#[derive(Clone)]
 pub struct BearerTokens {
-    tokens: Vec<String>,
+    token_file_path: Arc<str>,
+    tokens: Arc<RwLock<Vec<String>>>,
+}
+
+fn read_tokens(token_file_path: &str) -> Result<Vec<String>, String> {
+    let contents = fs::read_to_string(token_file_path)
+        .map_err(|error| format!("failed to read {token_file_path}: {error}"))?;
+
+    let tokens: Vec<String> = contents
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    if tokens.is_empty() {
+        return Err(format!("bearer token file {token_file_path} contains no tokens"));
+    }
+
+    Ok(tokens)
 }
 
 impl BearerTokens {
     fn load(token_file_path: &str) -> Self {
-        let contents = fs::read_to_string(token_file_path).unwrap_or_else(|error| {
-            panic!("failed to read bearer token file {token_file_path}: {error}")
-        });
+        let tokens = read_tokens(token_file_path)
+            .unwrap_or_else(|error| panic!("failed to load bearer tokens: {error}"));
 
-        let tokens: Vec<String> = contents
-            .lines()
-            .map(|line| line.trim().to_string())
-            .filter(|line| !line.is_empty())
-            .collect();
-
-        if tokens.is_empty() {
-            panic!("bearer token file {token_file_path} contains no tokens");
+        BearerTokens {
+            token_file_path: Arc::from(token_file_path),
+            tokens: Arc::new(RwLock::new(tokens)),
         }
+    }
 
-        BearerTokens { tokens }
+    fn reload(&self) {
+        match read_tokens(&self.token_file_path) {
+            Ok(reloaded_tokens) => {
+                let token_count = reloaded_tokens.len();
+                *self.tokens.write().expect("bearer token lock poisoned") = reloaded_tokens;
+                event!(
+                    name: "proxy.tokens.reloaded",
+                    Level::INFO,
+                    file.path = &*self.token_file_path,
+                    token.count = token_count,
+                    "reloaded {{token.count}} bearer tokens from {{file.path}}",
+                );
+            }
+            Err(error) => {
+                event!(
+                    name: "proxy.tokens.reload_failed",
+                    Level::ERROR,
+                    file.path = &*self.token_file_path,
+                    error.message = error,
+                    "keeping existing bearer tokens, failed to reload {{file.path}}: {{error.message}}",
+                );
+            }
+        }
     }
 
     fn accepts(&self, presented_token: &str) -> bool {
+        let tokens = self.tokens.read().expect("bearer token lock poisoned");
         // fold rather than any: any short-circuits on the first match, which
         // would leak through timing which of the accepted tokens was presented.
-        self.tokens.iter().fold(false, |accepted, token| {
+        tokens.iter().fold(false, |accepted, token| {
             constant_time_equals(token.as_bytes(), presented_token.as_bytes()) || accepted
         })
     }
+}
+
+fn spawn_token_reload_signal_handler(reloadable_tokens: Vec<BearerTokens>) {
+    let mut signals = Signals::new([SIGHUP]).expect("failed to register SIGHUP handler");
+    thread::spawn(move || {
+        for _signal in signals.forever() {
+            event!(
+                name: "proxy.tokens.reload_requested",
+                Level::INFO,
+                "received SIGHUP, reloading bearer tokens",
+            );
+            for tokens in &reloadable_tokens {
+                tokens.reload();
+            }
+        }
+    });
 }
 
 fn constant_time_equals(left: &[u8], right: &[u8]) -> bool {
@@ -228,7 +285,8 @@ impl HostProxy {
     /// Route requests only when they carry `Authorization: Bearer <token>` with
     /// a token listed in `token_file_path`, one per line. Unauthenticated
     /// requests receive a 401 and never reach the upstream, so this suits
-    /// machine-to-machine endpoints that must be publicly reachable.
+    /// machine-to-machine endpoints that must be publicly reachable. The file is
+    /// reloaded on SIGHUP, so tokens rotate without restarting the proxy.
     pub fn authenticated_route(
         mut self,
         hostname: impl Into<String>,
@@ -307,6 +365,18 @@ impl HostProxy {
             }
         }
 
+        let reloadable_tokens: Vec<BearerTokens> = self
+            .routes_by_hostname
+            .values()
+            .filter_map(|route| match route {
+                Route::Proxy {
+                    bearer_tokens: Some(bearer_tokens),
+                    ..
+                } => Some(bearer_tokens.clone()),
+                _ => None,
+            })
+            .collect();
+
         let mut contexts_by_hostname = HashMap::new();
         let first_certificate = &self.certificates[0];
 
@@ -363,6 +433,9 @@ impl HostProxy {
 
         server.add_service(router_service);
         server.add_service(redirect_service);
+
+        spawn_token_reload_signal_handler(reloadable_tokens);
+
         server.run_forever();
     }
 }
@@ -601,11 +674,16 @@ impl ProxyHttp for RedirectToHttps {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, RwLock};
+
     use super::{BearerTokens, constant_time_equals};
 
     fn tokens(values: &[&str]) -> BearerTokens {
         BearerTokens {
-            tokens: values.iter().map(|value| value.to_string()).collect(),
+            token_file_path: Arc::from("test-tokens"),
+            tokens: Arc::new(RwLock::new(
+                values.iter().map(|value| value.to_string()).collect(),
+            )),
         }
     }
 
@@ -632,5 +710,40 @@ mod tests {
         assert!(!accepted.accepts("first"));
         assert!(!accepted.accepts("first-token-extra"));
         assert!(!accepted.accepts(""));
+    }
+
+    fn temporary_token_file(contents: &str, label: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("host-proxy-{}-{label}", std::process::id()));
+        std::fs::write(&path, contents).expect("failed to write temporary token file");
+        path
+    }
+
+    #[test]
+    fn reload_swaps_the_accepted_token_set() {
+        let path = temporary_token_file("first-token\n", "reload-swap");
+        let accepted = BearerTokens::load(path.to_str().unwrap());
+        assert!(accepted.accepts("first-token"));
+
+        std::fs::write(&path, "second-token\n").unwrap();
+        accepted.reload();
+
+        assert!(accepted.accepts("second-token"));
+        assert!(!accepted.accepts("first-token"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn reload_keeps_existing_tokens_when_the_new_file_is_empty() {
+        let path = temporary_token_file("only-token\n", "reload-empty");
+        let accepted = BearerTokens::load(path.to_str().unwrap());
+
+        std::fs::write(&path, "\n   \n").unwrap();
+        accepted.reload();
+
+        assert!(accepted.accepts("only-token"));
+
+        std::fs::remove_file(&path).ok();
     }
 }

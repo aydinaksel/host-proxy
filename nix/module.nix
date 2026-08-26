@@ -70,9 +70,10 @@ in
               Path to a file of accepted bearer tokens, one per line. When set,
               requests must carry a matching Authorization: Bearer header or
               receive a 401 without reaching the upstream. Listing several
-              tokens allows rotation without downtime. The file is read once at
-              startup, so changing it requires restarting the service. Ignored
-              for redirects.
+              tokens allows rotation without downtime. The file is reloaded when
+              the service receives SIGHUP, so `systemctl reload host-proxy`
+              picks up token changes without dropping connections. Ignored for
+              redirects.
             '';
           };
         };
@@ -156,6 +157,7 @@ in
 
       serviceConfig = {
         ExecStart = "${package}/bin/host-proxy";
+        ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
         User = "host-proxy";
         Group = "host-proxy";
         Restart = "on-failure";

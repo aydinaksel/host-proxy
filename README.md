@@ -25,7 +25,8 @@ A route is one of:
     and answers 401 otherwise. Tokens are compared in constant time and the file
     may list several, so a token can be rotated by adding the replacement,
     moving every client over, and only then removing the old one. The file is
-    read at startup, so changes take effect on restart. Suits
+    reloaded on `SIGHUP` (`systemctl reload host-proxy`), so token changes take
+    effect without dropping connections. Suits
     machine-to-machine endpoints that must be publicly reachable; access and
     authentication compose, so a route can require both.
 -   **Redirect**, which answers `301` with `Location: https://<target><path>`.
