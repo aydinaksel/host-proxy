@@ -487,6 +487,13 @@ fn requested_path_and_query(session: &Session) -> &str {
         .unwrap_or("/")
 }
 
+fn client_ip_address(session: &Session) -> Option<IpAddr> {
+    session
+        .client_addr()
+        .and_then(|socket_address| socket_address.as_inet())
+        .map(|inet_socket_address| inet_socket_address.ip())
+}
+
 fn requested_hostname(session: &Session) -> Option<String> {
     if let Some(authority) = session.req_header().uri.authority() {
         return Some(authority.host().to_ascii_lowercase());
@@ -549,25 +556,17 @@ impl ProxyHttp for HostRouter {
         };
 
         if access == Access::Private {
-            let client_address_string = session
-                .client_addr()
-                .map(|address| address.to_string())
-                .unwrap_or_default();
-            let client_ip_string = client_address_string
-                .split(':')
-                .next()
-                .unwrap_or(&client_address_string);
-            let is_allowed = client_ip_string
-                .parse::<IpAddr>()
-                .map(is_private_client)
-                .unwrap_or(false);
+            let client_address = client_ip_address(session);
+            let is_allowed = client_address.map(is_private_client).unwrap_or(false);
 
             if !is_allowed {
                 event!(
                     name: "proxy.route.forbidden",
                     Level::WARN,
                     server.address = hostname,
-                    client.address = client_ip_string,
+                    client.address = client_address
+                        .map(|address| address.to_string())
+                        .unwrap_or_default(),
                     "denied public access to private route {{server.address}} from {{client.address}}",
                 );
                 session.respond_error(403).await?;
@@ -625,13 +624,8 @@ impl ProxyHttp for HostRouter {
         upstream_request: &mut RequestHeader,
         _routed_upstream_address: &mut Self::CTX,
     ) -> Result<()> {
-        if let Some(client_socket_address) = session.client_addr() {
-            let client_socket_address = client_socket_address.to_string();
-            let client_ip_address = client_socket_address
-                .split(':')
-                .next()
-                .unwrap_or(&client_socket_address);
-            upstream_request.insert_header("X-Forwarded-For", client_ip_address)?;
+        if let Some(client_address) = client_ip_address(session) {
+            upstream_request.insert_header("X-Forwarded-For", client_address.to_string())?;
         }
         upstream_request.insert_header("X-Forwarded-Proto", "https")?;
         Ok(())
