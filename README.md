@@ -9,6 +9,10 @@ configuration, so the same binary serves every host.
     you can load several certificates and each must merely cover the hostnames
     it serves.
 -   Port 80 only redirects to HTTPS.
+-   Both ports listen on IPv4 and IPv6. IPv6 clients only arrive once the
+    routed hostnames publish AAAA records; without them nothing changes.
+    Private routes accept IPv6 loopback and unique local addresses
+    (`fc00::/7`, which covers Tailscale's IPv6 range).
 -   Hostname matching is exact. Requests for unrouted hosts receive a 404 and
     never reach an upstream.
 

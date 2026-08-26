@@ -8,6 +8,8 @@ use async_trait::async_trait;
 use signal_hook::consts::SIGHUP;
 use signal_hook::iterator::Signals;
 use pingora::http::ResponseHeader;
+use pingora::listeners::TcpSocketOptions;
+use pingora::listeners::tls::TlsSettings;
 use pingora::prelude::*;
 use pingora::proxy::{ProxyHttp, Session};
 use pingora::tls::nid::Nid;
@@ -38,7 +40,16 @@ fn is_private_client(address: IpAddr) -> bool {
                 || ipv4.is_private()
                 || is_tailscale
         }
-        IpAddr::V6(ipv6) => ipv6.is_loopback(),
+        IpAddr::V6(ipv6) => {
+            if let Some(mapped_ipv4) = ipv6.to_ipv4_mapped() {
+                return is_private_client(IpAddr::V4(mapped_ipv4));
+            }
+            // Unique local addresses: fc00::/7, which includes Tailscale's
+            // fd7a:115c:a1e0::/48
+            let is_unique_local = (ipv6.segments()[0] & 0xfe00) == 0xfc00;
+
+            ipv6.is_loopback() || is_unique_local
+        }
     }
 }
 
@@ -409,27 +420,23 @@ impl HostProxy {
         );
         router_service.threads = Some(available_worker_thread_count());
 
-        let mut tls_settings = pingora::listeners::tls::TlsSettings::intermediate(
-            &first_certificate.certificate_path,
-            &first_certificate.private_key_path,
-        )
-        .expect("failed to create TLS settings");
+        let mut ipv6_only_options = TcpSocketOptions::default();
+        ipv6_only_options.ipv6_only = Some(true);
 
-        let sni_resolver = Arc::clone(&resolver);
-        tls_settings.set_servername_callback(move |ssl: &mut SslRef, _| {
-            if let Some(server_name) = ssl.servername(NameType::HOST_NAME) {
-                if let Some(context) = sni_resolver.resolve(server_name) {
-                    ssl.set_ssl_context(context).ok();
-                }
-            }
-            Ok(())
-        });
-
-        tls_settings.enable_h2();
-        router_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings);
+        router_service.add_tls_with_settings(
+            "0.0.0.0:443",
+            None,
+            build_tls_settings(first_certificate, &resolver),
+        );
+        router_service.add_tls_with_settings(
+            "[::]:443",
+            Some(ipv6_only_options.clone()),
+            build_tls_settings(first_certificate, &resolver),
+        );
 
         let mut redirect_service = http_proxy_service(&server.configuration, RedirectToHttps);
         redirect_service.add_tcp("0.0.0.0:80");
+        redirect_service.add_tcp_with_settings("[::]:80", ipv6_only_options);
 
         server.add_service(router_service);
         server.add_service(redirect_service);
@@ -444,6 +451,30 @@ impl Default for HostProxy {
     fn default() -> Self {
         HostProxy::new()
     }
+}
+
+fn build_tls_settings(
+    first_certificate: &Certificate,
+    resolver: &Arc<CertificateResolver>,
+) -> TlsSettings {
+    let mut tls_settings = TlsSettings::intermediate(
+        &first_certificate.certificate_path,
+        &first_certificate.private_key_path,
+    )
+    .expect("failed to create TLS settings");
+
+    let sni_resolver = Arc::clone(resolver);
+    tls_settings.set_servername_callback(move |ssl: &mut SslRef, _| {
+        if let Some(server_name) = ssl.servername(NameType::HOST_NAME) {
+            if let Some(context) = sni_resolver.resolve(server_name) {
+                ssl.set_ssl_context(context).ok();
+            }
+        }
+        Ok(())
+    });
+
+    tls_settings.enable_h2();
+    tls_settings
 }
 
 struct HostRouter {
@@ -668,9 +699,39 @@ impl ProxyHttp for RedirectToHttps {
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
     use std::sync::{Arc, RwLock};
 
-    use super::{BearerTokens, constant_time_equals};
+    use super::{BearerTokens, constant_time_equals, is_private_client};
+
+    fn parsed(address: &str) -> IpAddr {
+        address.parse().expect("invalid test address")
+    }
+
+    #[test]
+    fn private_clients_include_loopback_rfc1918_and_tailscale() {
+        assert!(is_private_client(parsed("127.0.0.1")));
+        assert!(is_private_client(parsed("10.0.0.2")));
+        assert!(is_private_client(parsed("192.168.1.10")));
+        assert!(is_private_client(parsed("100.64.0.1")));
+        assert!(is_private_client(parsed("100.127.255.254")));
+        assert!(!is_private_client(parsed("100.63.255.255")));
+        assert!(!is_private_client(parsed("8.8.8.8")));
+    }
+
+    #[test]
+    fn private_clients_include_ipv6_loopback_and_unique_local() {
+        assert!(is_private_client(parsed("::1")));
+        assert!(is_private_client(parsed("fc00::1")));
+        assert!(is_private_client(parsed("fd7a:115c:a1e0::1")));
+        assert!(!is_private_client(parsed("2001:db8::1")));
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_clients_follow_the_ipv4_rules() {
+        assert!(is_private_client(parsed("::ffff:192.168.1.10")));
+        assert!(!is_private_client(parsed("::ffff:8.8.8.8")));
+    }
 
     fn tokens(values: &[&str]) -> BearerTokens {
         BearerTokens {
