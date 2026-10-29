@@ -33,6 +33,16 @@ A route is one of:
     effect without dropping connections. Suits
     machine-to-machine endpoints that must be publicly reachable; access and
     authentication compose, so a route can require both.
+Any proxied route can also **identify tailnet users**: host-proxy asks the
+local tailscaled which tailnet user each client is, through its `whois` API, and
+passes the answer upstream in `X-Tailnet-User-Login` and `X-Tailnet-User-Name`.
+Only clients with tailnet addresses are looked up, answers are cached for a
+minute per address, and a client that cannot be identified is forwarded without
+the headers rather than refused. Every route strips those headers from client
+requests, whether or not it identifies anyone, so an upstream can trust them.
+A host with no identifying route never contacts tailscaled. Pair it with a
+private route so only tailnet clients reach the upstream at all.
+
 -   **Redirect**, which answers `301` with `Location: https://<target><path>`.
     TLS still terminates here, so a certificate covering the redirected
     hostname is required. The target is fixed configuration and is never taken
@@ -46,6 +56,8 @@ The `host-proxy` binary reads these environment variables:
     -   `hostname=host:port` — public proxy.
     -   `hostname=host:port!private` — private proxy.
     -   `hostname=host:port!bearer=/path/to/tokens` — authenticated proxy.
+    -   `hostname=host:port!tailnet-identity` — proxy that identifies tailnet
+        users.
     -   `hostname=>targethost` — permanent redirect to `https://targethost`.
 
     Tags combine, so `hostname=host:port!private!bearer=/path/to/tokens`
@@ -59,6 +71,8 @@ The `host-proxy` binary reads these environment variables:
     accepted from a single client IP address. Clients over the limit receive a
     429 with `Retry-After: 1` before any routing or authentication work
     happens. Unset means no rate limiting; the NixOS module defaults to 100.
+-   `HOST_PROXY_TAILSCALED_SOCKET` (optional): the tailscaled socket that
+    identifying routes ask. Defaults to `/run/tailscale/tailscaled.sock`.
 -   `HOST_PROXY_METRICS_ADDRESS` (optional): `host:port` to serve Prometheus
     metrics on, e.g. `127.0.0.1:9184`. The endpoint carries no authentication
     of its own, so bind it to loopback or a private interface. Alongside the
@@ -81,6 +95,11 @@ services.hostProxy = {
     "ingest.example.org" = {
       upstreamAddress = "127.0.0.1:5000";
       bearerTokenFile = "/run/secrets/ingest-tokens";
+    };
+    "tools.example.org" = {
+      upstreamAddress = "127.0.0.1:6000";
+      access = "private";
+      identifyTailnetUsers = true;
     };
     "www.example.org" = { redirectTo = "example.org"; };
   };

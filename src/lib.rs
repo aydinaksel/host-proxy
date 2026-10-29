@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs;
 use std::net::IpAddr;
@@ -26,6 +26,11 @@ use pingora::Error;
 use pingora_limits::rate::Rate;
 use pingora_prometheus::prometheus::{self, IntCounter, IntCounterVec};
 use tracing::{event, Level};
+
+pub use crate::tailnet::DEFAULT_TAILSCALED_SOCKET_PATH;
+use crate::tailnet::{TailnetIdentity, TailnetWhois};
+
+mod tailnet;
 
 const NEGOTIATED_ALPN_PROTOCOLS: &[u8] = b"\x02h2\x08http/1.1";
 
@@ -388,6 +393,7 @@ enum Route {
         upstream_address: String,
         access: Access,
         bearer_token_file_path: Option<String>,
+        identifies_tailnet_users: bool,
     },
     Redirect {
         target_host: String,
@@ -399,6 +405,7 @@ enum LoadedRoute {
         upstream_address: String,
         access: Access,
         bearer_tokens: Option<BearerTokens>,
+        identifies_tailnet_users: bool,
     },
     Redirect {
         target_host: String,
@@ -412,6 +419,7 @@ impl Route {
                 upstream_address,
                 access,
                 bearer_token_file_path,
+                identifies_tailnet_users,
             } => {
                 let access_label = match access {
                     Access::Public => "public",
@@ -424,7 +432,8 @@ impl Route {
                     upstream.address = upstream_address,
                     route.access = access_label,
                     route.authenticated = bearer_token_file_path.is_some(),
-                    "routing {{server.address}} to {{upstream.address}} ({{route.access}}, authenticated={{route.authenticated}})",
+                    route.tailnet_identity = identifies_tailnet_users,
+                    "routing {{server.address}} to {{upstream.address}} ({{route.access}}, authenticated={{route.authenticated}}, tailnet_identity={{route.tailnet_identity}})",
                 );
             }
             Route::Redirect { target_host } => {
@@ -445,6 +454,7 @@ impl Route {
                 upstream_address,
                 access,
                 bearer_token_file_path,
+                identifies_tailnet_users,
             } => {
                 let bearer_tokens = bearer_token_file_path
                     .map(|token_file_path| BearerTokens::load(&token_file_path))
@@ -453,6 +463,7 @@ impl Route {
                     upstream_address,
                     access,
                     bearer_tokens,
+                    identifies_tailnet_users,
                 })
             }
             Route::Redirect { target_host } => Ok(LoadedRoute::Redirect { target_host }),
@@ -465,6 +476,8 @@ pub struct HostProxy {
     certificates: Vec<Certificate>,
     rate_limit_per_second: Option<u32>,
     metrics_address: Option<String>,
+    tailnet_identity_hostnames: HashSet<String>,
+    tailscaled_socket_path: String,
 }
 
 impl HostProxy {
@@ -475,6 +488,8 @@ impl HostProxy {
             certificates: Vec::new(),
             rate_limit_per_second: None,
             metrics_address: None,
+            tailnet_identity_hostnames: HashSet::new(),
+            tailscaled_socket_path: DEFAULT_TAILSCALED_SOCKET_PATH.to_string(),
         }
     }
 
@@ -508,6 +523,7 @@ impl HostProxy {
                 upstream_address: upstream_address.into(),
                 access,
                 bearer_token_file_path: None,
+                identifies_tailnet_users: false,
             },
         );
         self
@@ -533,6 +549,7 @@ impl HostProxy {
                 upstream_address: upstream_address.into(),
                 access,
                 bearer_token_file_path: Some(token_file_path.into()),
+                identifies_tailnet_users: false,
             },
         );
         self
@@ -554,15 +571,29 @@ impl HostProxy {
     }
 
     #[must_use]
+    pub fn identify_tailnet_users(mut self, hostname: impl Into<String>) -> Self {
+        self.tailnet_identity_hostnames
+            .insert(hostname.into().to_ascii_lowercase());
+        self
+    }
+
+    #[must_use]
+    pub fn tailscaled_socket_path(mut self, socket_path: impl Into<String>) -> Self {
+        self.tailscaled_socket_path = socket_path.into();
+        self
+    }
+
+    #[must_use]
     pub fn certificate(mut self, certificate: Certificate) -> Self {
         self.certificates.push(certificate);
         self
     }
 
-    pub fn run(self) -> Result<Infallible, HostProxyError> {
+    pub fn run(mut self) -> Result<Infallible, HostProxyError> {
         if self.routes_by_hostname.is_empty() {
             return Err(HostProxyError::new("no routes configured"));
         }
+        self.apply_tailnet_identity()?;
 
         let mut loaded_routes_by_hostname = HashMap::new();
         let mut reloadable_tokens = Vec::new();
@@ -614,6 +645,7 @@ impl HostProxy {
                 routes_by_hostname: loaded_routes_by_hostname,
                 rate_limit: self.rate_limit_per_second.map(RateLimit::new),
                 request_metrics: RequestMetrics::register()?,
+                tailnet_whois: TailnetWhois::new(self.tailscaled_socket_path),
             },
         );
         router_service.threads = Some(available_worker_thread_count());
@@ -660,6 +692,25 @@ impl HostProxy {
     }
 }
 
+impl HostProxy {
+    fn apply_tailnet_identity(&mut self) -> Result<(), HostProxyError> {
+        for hostname in &self.tailnet_identity_hostnames {
+            match self.routes_by_hostname.get_mut(hostname) {
+                Some(Route::Proxy {
+                    identifies_tailnet_users,
+                    ..
+                }) => *identifies_tailnet_users = true,
+                Some(Route::Redirect { .. }) | None => {
+                    return Err(HostProxyError::new(format!(
+                        "{hostname} identifies tailnet users but is not a proxied route"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Default for HostProxy {
     fn default() -> Self {
         HostProxy::new()
@@ -701,12 +752,14 @@ struct HostRouter {
     routes_by_hostname: HashMap<String, LoadedRoute>,
     rate_limit: Option<RateLimit>,
     request_metrics: RequestMetrics,
+    tailnet_whois: TailnetWhois,
 }
 
 #[derive(Default)]
 pub struct RequestContext {
     routed_hostname: Option<String>,
     upstream_address: Option<String>,
+    tailnet_identity: Option<TailnetIdentity>,
 }
 
 struct RedirectToHttps;
@@ -753,11 +806,27 @@ fn requested_path_and_query(session: &Session) -> &str {
         .map_or("/", PathAndQuery::as_str)
 }
 
+fn client_socket_address(session: &Session) -> Option<std::net::SocketAddr> {
+    session.client_addr().and_then(SocketAddr::as_inet).copied()
+}
+
 fn client_ip_address(session: &Session) -> Option<IpAddr> {
-    session
-        .client_addr()
-        .and_then(SocketAddr::as_inet)
-        .map(std::net::SocketAddr::ip)
+    client_socket_address(session).map(|socket_address| socket_address.ip())
+}
+
+fn insert_identity_header(upstream_request: &mut RequestHeader, name: &'static str, value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    if let Err(error) = upstream_request.insert_header(name, value) {
+        event!(
+            name: "proxy.tailnet.header_rejected",
+            Level::WARN,
+            http.header.name = name,
+            error.message = error.to_string(),
+            "left out the {{http.header.name}} header: {{error.message}}",
+        );
+    }
 }
 
 fn requested_hostname(session: &Session) -> Option<String> {
@@ -823,7 +892,7 @@ impl ProxyHttp for HostRouter {
 
         context.routed_hostname = Some(hostname.clone());
 
-        let (upstream_address, access, bearer_tokens) = match route {
+        let (upstream_address, access, bearer_tokens, identifies_tailnet_users) = match route {
             LoadedRoute::Redirect { target_host } => {
                 let redirect_location =
                     format!("https://{target_host}{}", requested_path_and_query(session));
@@ -834,7 +903,13 @@ impl ProxyHttp for HostRouter {
                 upstream_address,
                 access,
                 bearer_tokens,
-            } => (upstream_address, *access, bearer_tokens.as_ref()),
+                identifies_tailnet_users,
+            } => (
+                upstream_address,
+                *access,
+                bearer_tokens.as_ref(),
+                *identifies_tailnet_users,
+            ),
         };
 
         if access == Access::Private {
@@ -880,6 +955,12 @@ impl ProxyHttp for HostRouter {
             }
         }
 
+        if identifies_tailnet_users {
+            if let Some(client) = client_socket_address(session) {
+                context.tailnet_identity = self.tailnet_whois.identify(client).await;
+            }
+        }
+
         context.upstream_address = Some(upstream_address.clone());
         Ok(false)
     }
@@ -908,12 +989,26 @@ impl ProxyHttp for HostRouter {
         &self,
         session: &mut Session,
         upstream_request: &mut RequestHeader,
-        _context: &mut Self::CTX,
+        context: &mut Self::CTX,
     ) -> Result<()> {
         if let Some(client_address) = client_ip_address(session) {
             upstream_request.insert_header("X-Forwarded-For", client_address.to_string())?;
         }
         upstream_request.insert_header("X-Forwarded-Proto", "https")?;
+        upstream_request.remove_header(tailnet::USER_LOGIN_HEADER);
+        upstream_request.remove_header(tailnet::USER_NAME_HEADER);
+        if let Some(identity) = &context.tailnet_identity {
+            insert_identity_header(
+                upstream_request,
+                tailnet::USER_LOGIN_HEADER,
+                &identity.login_name,
+            );
+            insert_identity_header(
+                upstream_request,
+                tailnet::USER_NAME_HEADER,
+                &identity.display_name,
+            );
+        }
         Ok(())
     }
 
@@ -985,7 +1080,7 @@ mod tests {
     use std::net::IpAddr;
     use std::sync::{Arc, RwLock};
 
-    use super::{constant_time_equals, is_private_client, BearerTokens};
+    use super::{constant_time_equals, is_private_client, Access, BearerTokens, HostProxy, Route};
 
     fn parsed(address: &str) -> IpAddr {
         address.parse().expect("invalid test address")
@@ -1082,5 +1177,40 @@ mod tests {
         assert!(accepted.accepts("only-token"));
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    fn identifies_tailnet_users(proxy: &HostProxy, hostname: &str) -> bool {
+        matches!(
+            proxy.routes_by_hostname.get(hostname),
+            Some(Route::Proxy {
+                identifies_tailnet_users: true,
+                ..
+            })
+        )
+    }
+
+    #[test]
+    fn tailnet_identity_is_off_unless_a_route_asks_for_it() {
+        let mut proxy = HostProxy::new()
+            .route("app.example.org", "127.0.0.1:3000", Access::Private)
+            .route("other.example.org", "127.0.0.1:4000", Access::Private)
+            .identify_tailnet_users("App.Example.org");
+        proxy.apply_tailnet_identity().unwrap();
+
+        assert!(identifies_tailnet_users(&proxy, "app.example.org"));
+        assert!(!identifies_tailnet_users(&proxy, "other.example.org"));
+    }
+
+    #[test]
+    fn tailnet_identity_on_a_redirect_or_an_unknown_host_fails_at_startup() {
+        let mut redirecting = HostProxy::new()
+            .redirect("www.example.org", "example.org")
+            .identify_tailnet_users("www.example.org");
+        let mut unknown = HostProxy::new()
+            .route("app.example.org", "127.0.0.1:3000", Access::Private)
+            .identify_tailnet_users("typo.example.org");
+
+        redirecting.apply_tailnet_identity().unwrap_err();
+        unknown.apply_tailnet_identity().unwrap_err();
     }
 }

@@ -9,6 +9,8 @@ const ROUTES_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_ROUTES";
 const CERTIFICATES_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_CERTIFICATES";
 const RATE_LIMIT_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_RATE_LIMIT_PER_SECOND";
 const METRICS_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_METRICS_ADDRESS";
+const TAILSCALED_SOCKET_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_TAILSCALED_SOCKET";
+const TAILNET_IDENTITY_TAG: &str = "tailnet-identity";
 
 fn required_environment_variable(name: &str) -> Result<String, HostProxyError> {
     env::var(name).map_err(|error| {
@@ -58,6 +60,11 @@ fn configure_and_run() -> Result<Infallible, HostProxyError> {
         proxy = proxy.metrics_address(metrics_address);
     }
 
+    if let Some(socket_path) = optional_environment_variable(TAILSCALED_SOCKET_ENVIRONMENT_VARIABLE)
+    {
+        proxy = proxy.tailscaled_socket_path(socket_path);
+    }
+
     for route_entry in route_specification
         .split(',')
         .filter(|route_entry| !route_entry.is_empty())
@@ -66,7 +73,7 @@ fn configure_and_run() -> Result<Infallible, HostProxyError> {
             return Err(HostProxyError::new(format!(
                 "invalid route entry {route_entry:?} in {ROUTES_ENVIRONMENT_VARIABLE}, \
                  expected hostname=address, hostname=address!private, \
-                 hostname=address!bearer=/path/to/tokens, or hostname=>redirecthost"
+                 hostname=address!bearer=/path/to/tokens, hostname=address!tailnet-identity, or hostname=>redirecthost"
             )));
         };
 
@@ -78,11 +85,14 @@ fn configure_and_run() -> Result<Infallible, HostProxyError> {
 
             let mut access = Access::Public;
             let mut token_file_path = None;
+            let mut identifies_tailnet_users = false;
 
             for tag in tags {
                 let tag = tag.trim();
                 if let Some(path) = tag.strip_prefix("bearer=") {
                     token_file_path = Some(path.trim().to_string());
+                } else if tag == TAILNET_IDENTITY_TAG {
+                    identifies_tailnet_users = true;
                 } else {
                     access = match tag {
                         "private" => Access::Private,
@@ -90,18 +100,23 @@ fn configure_and_run() -> Result<Infallible, HostProxyError> {
                         other => {
                             return Err(HostProxyError::new(format!(
                                 "unknown route tag {other:?}, expected 'private', 'public', \
-                                 or 'bearer=/path/to/tokens'"
+                                 'tailnet-identity', or 'bearer=/path/to/tokens'"
                             )));
                         }
                     };
                 }
             }
 
-            match token_file_path {
+            let routed = match token_file_path {
                 Some(path) => {
                     proxy.authenticated_route(hostname.trim(), upstream_address, access, path)
                 }
                 None => proxy.route(hostname.trim(), upstream_address, access),
+            };
+            if identifies_tailnet_users {
+                routed.identify_tailnet_users(hostname.trim())
+            } else {
+                routed
             }
         };
     }
