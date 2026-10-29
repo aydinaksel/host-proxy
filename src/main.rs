@@ -3,7 +3,7 @@ use std::env;
 use std::process::ExitCode;
 
 use host_proxy::{Access, Certificate, HostProxy, HostProxyError};
-use tracing::{Level, event};
+use tracing::{event, Level};
 
 const ROUTES_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_ROUTES";
 const CERTIFICATES_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_CERTIFICATES";

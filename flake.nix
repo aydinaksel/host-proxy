@@ -30,7 +30,7 @@
           inherit system overlays;
         };
 
-        rustToolchain = pkgs.rust-bin.stable."1.94.0".default;
+        rustToolchain = pkgs.rust-bin.stable."1.95.0".default;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
         commonArgs = {

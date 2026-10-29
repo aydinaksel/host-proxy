@@ -6,24 +6,26 @@ use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use http::uri::PathAndQuery;
 use pingora::http::ResponseHeader;
-use pingora::listeners::TcpSocketOptions;
 use pingora::listeners::tls::TlsSettings;
-use pingora::server::ShutdownWatch;
-use pingora::server::configuration::Opt;
-use pingora::services::background::{BackgroundService, background_service};
+use pingora::listeners::TcpSocketOptions;
 use pingora::prelude::*;
+use pingora::protocols::l4::socket::SocketAddr;
 use pingora::proxy::{ProxyHttp, Session};
+use pingora::server::configuration::Opt;
+use pingora::server::ShutdownWatch;
+use pingora::services::background::{background_service, BackgroundService};
 use pingora::tls::nid::Nid;
 use pingora::tls::pkey::PKey;
 use pingora::tls::ssl::{
-    AlpnError, NameType, SslContext, SslMethod, SslRef, SslVersion, select_next_proto,
+    select_next_proto, AlpnError, NameType, SslContext, SslMethod, SslRef, SslVersion,
 };
 use pingora::tls::x509::X509;
-use pingora::{Error, ErrorType};
+use pingora::Error;
 use pingora_limits::rate::Rate;
-use prometheus::{IntCounter, IntCounterVec};
-use tracing::{Level, event};
+use pingora_prometheus::prometheus::{self, IntCounter, IntCounterVec};
+use tracing::{event, Level};
 
 const NEGOTIATED_ALPN_PROTOCOLS: &[u8] = b"\x02h2\x08http/1.1";
 
@@ -33,6 +35,7 @@ pub struct HostProxyError {
 }
 
 impl HostProxyError {
+    #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
         HostProxyError {
             message: message.into(),
@@ -49,8 +52,8 @@ impl std::fmt::Display for HostProxyError {
 impl std::error::Error for HostProxyError {}
 
 const UPSTREAM_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
-const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(300);
-const UPSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(300);
+const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_mins(5);
+const UPSTREAM_WRITE_TIMEOUT: Duration = Duration::from_mins(5);
 const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -66,9 +69,7 @@ fn is_private_client(address: IpAddr) -> bool {
             let [first_octet, second_octet, _, _] = ipv4.octets();
             let is_tailscale = first_octet == 100 && (second_octet & 0xC0) == 64;
 
-            ipv4.is_loopback()
-                || ipv4.is_private()
-                || is_tailscale
+            ipv4.is_loopback() || ipv4.is_private() || is_tailscale
         }
         IpAddr::V6(ipv6) => {
             if let Some(mapped_ipv4) = ipv6.to_ipv4_mapped() {
@@ -105,7 +106,9 @@ fn read_tokens(token_file_path: &str) -> Result<Vec<String>, String> {
         .collect();
 
     if tokens.is_empty() {
-        return Err(format!("bearer token file {token_file_path} contains no tokens"));
+        return Err(format!(
+            "bearer token file {token_file_path} contains no tokens"
+        ));
     }
 
     Ok(tokens)
@@ -113,8 +116,9 @@ fn read_tokens(token_file_path: &str) -> Result<Vec<String>, String> {
 
 impl BearerTokens {
     fn load(token_file_path: &str) -> Result<Self, HostProxyError> {
-        let tokens = read_tokens(token_file_path)
-            .map_err(|error| HostProxyError::new(format!("failed to load bearer tokens: {error}")))?;
+        let tokens = read_tokens(token_file_path).map_err(|error| {
+            HostProxyError::new(format!("failed to load bearer tokens: {error}"))
+        })?;
 
         Ok(BearerTokens {
             token_file_path: Arc::from(token_file_path),
@@ -147,10 +151,13 @@ impl BearerTokens {
         }
     }
 
+    #[expect(
+        clippy::unnecessary_fold,
+        reason = "any short-circuits on the first match, which would leak through timing \
+                  which of the accepted tokens was presented"
+    )]
     fn accepts(&self, presented_token: &str) -> bool {
         let tokens = self.tokens.read().unwrap_or_else(PoisonError::into_inner);
-        // fold rather than any: any short-circuits on the first match, which
-        // would leak through timing which of the accepted tokens was presented.
         tokens.iter().fold(false, |accepted, token| {
             constant_time_equals(token.as_bytes(), presented_token.as_bytes()) || accepted
         })
@@ -164,8 +171,7 @@ struct TokenReloadService {
 #[async_trait]
 impl BackgroundService for TokenReloadService {
     async fn start(&self, mut shutdown: ShutdownWatch) {
-        let registration =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup());
+        let registration = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup());
         let Ok(mut hangup_signals) = registration else {
             event!(
                 name: "proxy.tokens.reload_unavailable",
@@ -227,7 +233,9 @@ impl RequestMetrics {
                 "Requests rejected with 429 by the per-client rate limit"
             )
             .map_err(|error| {
-                HostProxyError::new(format!("failed to register the rate limit counter: {error}"))
+                HostProxyError::new(format!(
+                    "failed to register the rate limit counter: {error}"
+                ))
             })?,
         })
     }
@@ -242,8 +250,7 @@ impl RateLimit {
     fn new(max_requests_per_second: u32) -> Self {
         RateLimit {
             requests_per_second_by_client: Rate::new(Duration::from_secs(1)),
-            max_requests_per_second: isize::try_from(max_requests_per_second)
-                .unwrap_or(isize::MAX),
+            max_requests_per_second: isize::try_from(max_requests_per_second).unwrap_or(isize::MAX),
         }
     }
 
@@ -261,6 +268,7 @@ pub struct Certificate {
 }
 
 impl Certificate {
+    #[must_use]
     pub fn new(certificate_path: String, private_key_path: String) -> Self {
         Certificate {
             certificate_path,
@@ -284,7 +292,10 @@ impl Certificate {
         })?;
         let mut chain_certificates = chain.into_iter();
         let x509 = chain_certificates.next().ok_or_else(|| {
-            HostProxyError::new(format!("certificate file {} is empty", self.certificate_path))
+            HostProxyError::new(format!(
+                "certificate file {} is empty",
+                self.certificate_path
+            ))
         })?;
         let private_key = PKey::private_key_from_pem(&private_key_pem).map_err(|error| {
             HostProxyError::new(format!(
@@ -322,26 +333,23 @@ impl Certificate {
                     ))
                 })?;
         }
-        context_builder.set_private_key(&private_key).map_err(|error| {
-            HostProxyError::new(format!(
-                "failed to set private key {} on the SSL context: {error}",
-                self.private_key_path
-            ))
-        })?;
+        context_builder
+            .set_private_key(&private_key)
+            .map_err(|error| {
+                HostProxyError::new(format!(
+                    "failed to set private key {} on the SSL context: {error}",
+                    self.private_key_path
+                ))
+            })?;
         context_builder.set_alpn_select_callback(|_ssl, client_protocols| {
-            select_next_proto(NEGOTIATED_ALPN_PROTOCOLS, client_protocols)
-                .ok_or(AlpnError::NOACK)
+            select_next_proto(NEGOTIATED_ALPN_PROTOCOLS, client_protocols).ok_or(AlpnError::NOACK)
         });
         let ssl_context = context_builder.build();
 
         let mut hostnames = Vec::new();
-        if let Some(common_name) = x509
-            .subject_name()
-            .entries_by_nid(Nid::COMMONNAME)
-            .next()
-        {
-            if let Ok(name) = common_name.data().as_utf8() {
-                hostnames.push(name.to_string().to_ascii_lowercase());
+        if let Some(common_name) = x509.subject_name().entries_by_nid(Nid::COMMONNAME).next() {
+            if let Ok(name) = common_name.data().to_string() {
+                hostnames.push(name.to_ascii_lowercase());
             }
         }
         if let Some(san) = x509.subject_alt_names() {
@@ -398,6 +406,39 @@ enum LoadedRoute {
 }
 
 impl Route {
+    fn log_configured(&self, hostname: &str) {
+        match self {
+            Route::Proxy {
+                upstream_address,
+                access,
+                bearer_token_file_path,
+            } => {
+                let access_label = match access {
+                    Access::Public => "public",
+                    Access::Private => "private",
+                };
+                event!(
+                    name: "proxy.route.configured",
+                    Level::INFO,
+                    server.address = hostname,
+                    upstream.address = upstream_address,
+                    route.access = access_label,
+                    route.authenticated = bearer_token_file_path.is_some(),
+                    "routing {{server.address}} to {{upstream.address}} ({{route.access}}, authenticated={{route.authenticated}})",
+                );
+            }
+            Route::Redirect { target_host } => {
+                event!(
+                    name: "proxy.redirect.configured",
+                    Level::INFO,
+                    server.address = hostname,
+                    redirect.target = target_host,
+                    "redirecting {{server.address}} to https://{{redirect.target}}",
+                );
+            }
+        }
+    }
+
     fn load(self) -> Result<LoadedRoute, HostProxyError> {
         match self {
             Route::Proxy {
@@ -427,6 +468,7 @@ pub struct HostProxy {
 }
 
 impl HostProxy {
+    #[must_use]
     pub fn new() -> Self {
         HostProxy {
             routes_by_hostname: HashMap::new(),
@@ -439,6 +481,7 @@ impl HostProxy {
     /// Serve Prometheus metrics over HTTP on this address. Bind it to
     /// loopback or a private interface; the endpoint carries no
     /// authentication of its own.
+    #[must_use]
     pub fn metrics_address(mut self, metrics_address: impl Into<String>) -> Self {
         self.metrics_address = Some(metrics_address.into());
         self
@@ -446,11 +489,13 @@ impl HostProxy {
 
     /// Reject clients exceeding this many requests per second, per client IP
     /// address, with a 429 before any routing or authentication work happens.
+    #[must_use]
     pub fn rate_limit_per_second(mut self, max_requests_per_second: u32) -> Self {
         self.rate_limit_per_second = Some(max_requests_per_second);
         self
     }
 
+    #[must_use]
     pub fn route(
         mut self,
         hostname: impl Into<String>,
@@ -474,6 +519,7 @@ impl HostProxy {
     /// machine-to-machine endpoints that must be publicly reachable. The file is
     /// read when [`HostProxy::run`] starts and reloaded on SIGHUP, so tokens
     /// rotate without restarting the proxy.
+    #[must_use]
     pub fn authenticated_route(
         mut self,
         hostname: impl Into<String>,
@@ -496,11 +542,8 @@ impl HostProxy {
     /// `https://{target_host}{path_and_query}`. The target is fixed
     /// configuration and is never taken from the request, so this cannot
     /// become an open redirect.
-    pub fn redirect(
-        mut self,
-        hostname: impl Into<String>,
-        target_host: impl Into<String>,
-    ) -> Self {
+    #[must_use]
+    pub fn redirect(mut self, hostname: impl Into<String>, target_host: impl Into<String>) -> Self {
         self.routes_by_hostname.insert(
             hostname.into().to_ascii_lowercase(),
             Route::Redirect {
@@ -510,6 +553,7 @@ impl HostProxy {
         self
     }
 
+    #[must_use]
     pub fn certificate(mut self, certificate: Certificate) -> Self {
         self.certificates.push(certificate);
         self
@@ -523,35 +567,13 @@ impl HostProxy {
         let mut loaded_routes_by_hostname = HashMap::new();
         let mut reloadable_tokens = Vec::new();
         for (hostname, route) in self.routes_by_hostname {
-            match &route {
-                Route::Proxy { upstream_address, access, bearer_token_file_path } => {
-                    let access_label = match access {
-                        Access::Public => "public",
-                        Access::Private => "private",
-                    };
-                    event!(
-                        name: "proxy.route.configured",
-                        Level::INFO,
-                        server.address = hostname,
-                        upstream.address = upstream_address,
-                        route.access = access_label,
-                        route.authenticated = bearer_token_file_path.is_some(),
-                        "routing {{server.address}} to {{upstream.address}} ({{route.access}}, authenticated={{route.authenticated}})",
-                    );
-                }
-                Route::Redirect { target_host } => {
-                    event!(
-                        name: "proxy.redirect.configured",
-                        Level::INFO,
-                        server.address = hostname,
-                        redirect.target = target_host,
-                        "redirecting {{server.address}} to https://{{redirect.target}}",
-                    );
-                }
-            }
-
+            route.log_configured(&hostname);
             let loaded_route = route.load()?;
-            if let LoadedRoute::Proxy { bearer_tokens: Some(bearer_tokens), .. } = &loaded_route {
+            if let LoadedRoute::Proxy {
+                bearer_tokens: Some(bearer_tokens),
+                ..
+            } = &loaded_route
+            {
                 reloadable_tokens.push(bearer_tokens.clone());
             }
             loaded_routes_by_hostname.insert(hostname, loaded_route);
@@ -618,8 +640,7 @@ impl HostProxy {
         server.add_service(redirect_service);
 
         if let Some(metrics_address) = &self.metrics_address {
-            let mut metrics_service =
-                pingora::services::listening::Service::prometheus_http_service();
+            let mut metrics_service = pingora_prometheus::prometheus_http_service();
             metrics_service.add_tcp(metrics_address);
             server.add_service(metrics_service);
             event!(
@@ -691,9 +712,7 @@ pub struct RequestContext {
 struct RedirectToHttps;
 
 fn available_worker_thread_count() -> usize {
-    std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1)
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
 }
 
 async fn write_permanent_redirect(session: &mut Session, location: String) -> Result<()> {
@@ -731,15 +750,14 @@ fn requested_path_and_query(session: &Session) -> &str {
         .req_header()
         .uri
         .path_and_query()
-        .map(|path_and_query| path_and_query.as_str())
-        .unwrap_or("/")
+        .map_or("/", PathAndQuery::as_str)
 }
 
 fn client_ip_address(session: &Session) -> Option<IpAddr> {
     session
         .client_addr()
-        .and_then(|socket_address| socket_address.as_inet())
-        .map(|inet_socket_address| inet_socket_address.ip())
+        .and_then(SocketAddr::as_inet)
+        .map(std::net::SocketAddr::ip)
 }
 
 fn requested_hostname(session: &Session) -> Option<String> {
@@ -769,11 +787,7 @@ impl ProxyHttp for HostRouter {
         RequestContext::default()
     }
 
-    async fn request_filter(
-        &self,
-        session: &mut Session,
-        context: &mut Self::CTX,
-    ) -> Result<bool> {
+    async fn request_filter(&self, session: &mut Session, context: &mut Self::CTX) -> Result<bool> {
         if let (Some(rate_limit), Some(client_address)) =
             (&self.rate_limit, client_ip_address(session))
         {
@@ -816,14 +830,16 @@ impl ProxyHttp for HostRouter {
                 write_permanent_redirect(session, redirect_location).await?;
                 return Ok(true);
             }
-            LoadedRoute::Proxy { upstream_address, access, bearer_tokens } => {
-                (upstream_address, *access, bearer_tokens.as_ref())
-            }
+            LoadedRoute::Proxy {
+                upstream_address,
+                access,
+                bearer_tokens,
+            } => (upstream_address, *access, bearer_tokens.as_ref()),
         };
 
         if access == Access::Private {
             let client_address = client_ip_address(session);
-            let is_allowed = client_address.map(is_private_client).unwrap_or(false);
+            let is_allowed = client_address.is_some_and(is_private_client);
 
             if !is_allowed {
                 event!(
@@ -848,9 +864,8 @@ impl ProxyHttp for HostRouter {
                 .and_then(|header_value| header_value.to_str().ok())
                 .and_then(|header_value| header_value.strip_prefix("Bearer "));
 
-            let is_authenticated = presented_token
-                .map(|token| accepted_tokens.accepts(token.trim()))
-                .unwrap_or(false);
+            let is_authenticated =
+                presented_token.is_some_and(|token| accepted_tokens.accepts(token.trim()));
 
             if !is_authenticated {
                 event!(
@@ -876,7 +891,7 @@ impl ProxyHttp for HostRouter {
     ) -> Result<Box<HttpPeer>> {
         let upstream_address = context.upstream_address.clone().ok_or_else(|| {
             Error::explain(
-                ErrorType::InternalError,
+                InternalError,
                 "upstream requested for a session that request_filter did not route",
             )
         })?;
@@ -908,8 +923,7 @@ impl ProxyHttp for HostRouter {
     {
         let status_code = session
             .response_written()
-            .map(|response_header| response_header.status.as_u16())
-            .unwrap_or(0);
+            .map_or(0, |response_header| response_header.status.as_u16());
         let hostname = context
             .routed_hostname
             .as_deref()
@@ -930,7 +944,7 @@ impl ProxyHttp for HostRouter {
             client.address = client_ip_address(session)
                 .map(|address| address.to_string())
                 .unwrap_or_default(),
-            error.message = error.map(|error| error.to_string()).unwrap_or_default(),
+            error.message = error.map(ToString::to_string).unwrap_or_default(),
             "{{http.request.method}} {{server.address}}{{url.path}} responded {{http.response.status_code}}",
         );
     }
@@ -952,8 +966,7 @@ impl ProxyHttp for RedirectToHttps {
             return Ok(true);
         };
 
-        let redirect_location =
-            format!("https://{hostname}{}", requested_path_and_query(session));
+        let redirect_location = format!("https://{hostname}{}", requested_path_and_query(session));
         write_permanent_redirect(session, redirect_location).await?;
         Ok(true)
     }
@@ -963,10 +976,7 @@ impl ProxyHttp for RedirectToHttps {
         _session: &mut Session,
         _context: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        Error::e_explain(
-            ErrorType::InternalError,
-            "the redirect service never proxies upstream",
-        )
+        Error::e_explain(InternalError, "the redirect service never proxies upstream")
     }
 }
 
@@ -975,7 +985,7 @@ mod tests {
     use std::net::IpAddr;
     use std::sync::{Arc, RwLock};
 
-    use super::{BearerTokens, constant_time_equals, is_private_client};
+    use super::{constant_time_equals, is_private_client, BearerTokens};
 
     fn parsed(address: &str) -> IpAddr {
         address.parse().expect("invalid test address")
@@ -1010,7 +1020,7 @@ mod tests {
         BearerTokens {
             token_file_path: Arc::from("test-tokens"),
             tokens: Arc::new(RwLock::new(
-                values.iter().map(|value| value.to_string()).collect(),
+                values.iter().map(ToString::to_string).collect(),
             )),
         }
     }
@@ -1041,8 +1051,7 @@ mod tests {
     }
 
     fn temporary_token_file(contents: &str, label: &str) -> std::path::PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("host-proxy-{}-{label}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("host-proxy-{}-{label}", std::process::id()));
         std::fs::write(&path, contents).expect("failed to write temporary token file");
         path
     }
