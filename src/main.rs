@@ -10,6 +10,8 @@ const CERTIFICATES_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_CERTIFICATES";
 const RATE_LIMIT_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_RATE_LIMIT_PER_SECOND";
 const METRICS_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_METRICS_ADDRESS";
 const TAILSCALED_SOCKET_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_TAILSCALED_SOCKET";
+const HTTPS_ADDRESSES_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_HTTPS_ADDRESSES";
+const HTTP_ADDRESSES_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_HTTP_ADDRESSES";
 const TAILNET_IDENTITY_TAG: &str = "tailnet-identity";
 
 fn required_environment_variable(name: &str) -> Result<String, HostProxyError> {
@@ -20,6 +22,17 @@ fn required_environment_variable(name: &str) -> Result<String, HostProxyError> {
 
 fn optional_environment_variable(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+fn address_list(name: &str) -> Option<Vec<String>> {
+    optional_environment_variable(name).map(|addresses| {
+        addresses
+            .split(',')
+            .map(str::trim)
+            .filter(|address| !address.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
 }
 
 fn main() -> ExitCode {
@@ -63,6 +76,14 @@ fn configure_and_run() -> Result<Infallible, HostProxyError> {
     if let Some(socket_path) = optional_environment_variable(TAILSCALED_SOCKET_ENVIRONMENT_VARIABLE)
     {
         proxy = proxy.tailscaled_socket_path(socket_path);
+    }
+
+    if let Some(addresses) = address_list(HTTPS_ADDRESSES_ENVIRONMENT_VARIABLE) {
+        proxy = proxy.https_addresses(addresses);
+    }
+
+    if let Some(addresses) = address_list(HTTP_ADDRESSES_ENVIRONMENT_VARIABLE) {
+        proxy = proxy.http_addresses(addresses);
     }
 
     for route_entry in route_specification

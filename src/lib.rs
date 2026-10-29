@@ -56,6 +56,18 @@ impl std::fmt::Display for HostProxyError {
 
 impl std::error::Error for HostProxyError {}
 
+const DEFAULT_HTTPS_ADDRESSES: [&str; 2] = ["0.0.0.0:443", "[::]:443"];
+const DEFAULT_HTTP_ADDRESSES: [&str; 2] = ["0.0.0.0:80", "[::]:80"];
+
+fn socket_options_for(address: &str) -> Option<TcpSocketOptions> {
+    let is_ipv6 = address.starts_with('[');
+    is_ipv6.then(|| {
+        let mut ipv6_only_options = TcpSocketOptions::default();
+        ipv6_only_options.ipv6_only = Some(true);
+        ipv6_only_options
+    })
+}
+
 const UPSTREAM_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_mins(5);
 const UPSTREAM_WRITE_TIMEOUT: Duration = Duration::from_mins(5);
@@ -478,6 +490,8 @@ pub struct HostProxy {
     metrics_address: Option<String>,
     tailnet_identity_hostnames: HashSet<String>,
     tailscaled_socket_path: String,
+    https_addresses: Vec<String>,
+    http_addresses: Vec<String>,
 }
 
 impl HostProxy {
@@ -490,6 +504,8 @@ impl HostProxy {
             metrics_address: None,
             tailnet_identity_hostnames: HashSet::new(),
             tailscaled_socket_path: DEFAULT_TAILSCALED_SOCKET_PATH.to_string(),
+            https_addresses: DEFAULT_HTTPS_ADDRESSES.map(str::to_string).to_vec(),
+            http_addresses: DEFAULT_HTTP_ADDRESSES.map(str::to_string).to_vec(),
         }
     }
 
@@ -578,6 +594,18 @@ impl HostProxy {
     }
 
     #[must_use]
+    pub fn https_addresses(mut self, addresses: Vec<String>) -> Self {
+        self.https_addresses = addresses;
+        self
+    }
+
+    #[must_use]
+    pub fn http_addresses(mut self, addresses: Vec<String>) -> Self {
+        self.http_addresses = addresses;
+        self
+    }
+
+    #[must_use]
     pub fn tailscaled_socket_path(mut self, socket_path: impl Into<String>) -> Self {
         self.tailscaled_socket_path = socket_path.into();
         self
@@ -650,23 +678,21 @@ impl HostProxy {
         );
         router_service.threads = Some(available_worker_thread_count());
 
-        let mut ipv6_only_options = TcpSocketOptions::default();
-        ipv6_only_options.ipv6_only = Some(true);
-
-        router_service.add_tls_with_settings(
-            "0.0.0.0:443",
-            None,
-            build_tls_settings(first_certificate, &resolver)?,
-        );
-        router_service.add_tls_with_settings(
-            "[::]:443",
-            Some(ipv6_only_options.clone()),
-            build_tls_settings(first_certificate, &resolver)?,
-        );
+        for address in &self.https_addresses {
+            router_service.add_tls_with_settings(
+                address,
+                socket_options_for(address),
+                build_tls_settings(first_certificate, &resolver)?,
+            );
+        }
 
         let mut redirect_service = http_proxy_service(&server.configuration, RedirectToHttps);
-        redirect_service.add_tcp("0.0.0.0:80");
-        redirect_service.add_tcp_with_settings("[::]:80", ipv6_only_options);
+        for address in &self.http_addresses {
+            match socket_options_for(address) {
+                Some(options) => redirect_service.add_tcp_with_settings(address, options),
+                None => redirect_service.add_tcp(address),
+            }
+        }
 
         server.add_service(router_service);
         server.add_service(redirect_service);

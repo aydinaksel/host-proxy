@@ -34,7 +34,13 @@
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
         commonArgs = {
-          src = craneLib.cleanCargoSource ./.;
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              (craneLib.fileset.commonCargoSources ./.)
+              ./tests/fixtures
+            ];
+          };
           strictDeps = true;
 
           nativeBuildInputs = [
@@ -55,7 +61,7 @@
           commonArgs
           // {
             pname = "host-proxy-deps";
-            version = "0.6.1";
+            version = "0.6.2";
           }
         );
 
@@ -63,7 +69,7 @@
           commonArgs
           // {
             pname = "host-proxy";
-            version = "0.6.1";
+            version = "0.6.2";
             inherit cargoArtifacts;
           }
         );

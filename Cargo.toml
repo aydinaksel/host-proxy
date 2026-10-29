@@ -1,6 +1,6 @@
 [package]
 name = "host-proxy"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 description = "A Pingora reverse proxy that routes by hostname, with per-SNI certificates, private and bearer-token routes, and zero-downtime reloads"
 license = "MIT"
@@ -83,6 +83,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 async-trait = "0.1"
 http = "1"
-tokio = { version = "1", features = ["io-util", "net", "signal", "time"] }
+# Pingora 0.9 builds every BufStream with zero capacity, which tokio 1.54 rejects:
+# https://github.com/cloudflare/pingora/issues/1059
+tokio = { version = ">=1, <1.54", features = ["io-util", "net", "signal", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

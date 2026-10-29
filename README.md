@@ -71,6 +71,9 @@ The `host-proxy` binary reads these environment variables:
     accepted from a single client IP address. Clients over the limit receive a
     429 with `Retry-After: 1` before any routing or authentication work
     happens. Unset means no rate limiting; the NixOS module defaults to 100.
+-   `HOST_PROXY_HTTPS_ADDRESSES` and `HOST_PROXY_HTTP_ADDRESSES` (optional):
+    comma-separated `host:port` addresses to listen on for HTTPS and for the
+    HTTP redirect. Default to `0.0.0.0:443,[::]:443` and `0.0.0.0:80,[::]:80`.
 -   `HOST_PROXY_TAILSCALED_SOCKET` (optional): the tailscaled socket that
     identifying routes ask. Defaults to `/run/tailscale/tailscaled.sock`.
 -   `HOST_PROXY_METRICS_ADDRESS` (optional): `host:port` to serve Prometheus
