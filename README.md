@@ -40,7 +40,7 @@ A route is one of:
 
 ## Configuration
 
-The `host-proxy` binary reads two environment variables:
+The `host-proxy` binary reads these environment variables:
 
 -   `HOST_PROXY_ROUTES`: comma-separated entries, each one of:
     -   `hostname=host:port` — public proxy.
@@ -108,3 +108,7 @@ bearer tokens. The NixOS module marks the unit `reloadIfChanged`, so
 
 Sending `SIGHUP` directly to the process re-reads only the bearer token files
 in place, without replacing the process.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
