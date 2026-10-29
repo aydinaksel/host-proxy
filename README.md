@@ -125,6 +125,12 @@ bearer tokens. The NixOS module marks the unit `reloadIfChanged`, so
 `nixos-rebuild switch` upgrades the running proxy the same way, and ACME's
 `reloadServices` picks up renewed certificates through it.
 
+Before it touches the running process, a reload starts the new one with
+`--test`, which loads the routes, certificates, and token files exactly as a
+real start would and exits without listening. If that fails, the reload fails
+and the old process keeps serving, so a bad certificate or an empty token file
+never takes the proxy down.
+
 Sending `SIGHUP` directly to the process re-reads only the bearer token files
 in place, without replacing the process.
 

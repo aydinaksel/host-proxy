@@ -593,7 +593,7 @@ impl HostProxy {
         if self.routes_by_hostname.is_empty() {
             return Err(HostProxyError::new("no routes configured"));
         }
-        self.apply_tailnet_identity()?;
+        self.apply_tailnet_identity();
 
         let mut loaded_routes_by_hostname = HashMap::new();
         let mut reloadable_tokens = Vec::new();
@@ -693,21 +693,21 @@ impl HostProxy {
 }
 
 impl HostProxy {
-    fn apply_tailnet_identity(&mut self) -> Result<(), HostProxyError> {
+    fn apply_tailnet_identity(&mut self) {
         for hostname in &self.tailnet_identity_hostnames {
             match self.routes_by_hostname.get_mut(hostname) {
                 Some(Route::Proxy {
                     identifies_tailnet_users,
                     ..
                 }) => *identifies_tailnet_users = true,
-                Some(Route::Redirect { .. }) | None => {
-                    return Err(HostProxyError::new(format!(
-                        "{hostname} identifies tailnet users but is not a proxied route"
-                    )));
-                }
+                Some(Route::Redirect { .. }) | None => event!(
+                    name: "proxy.tailnet.identity_ignored",
+                    Level::WARN,
+                    server.address = hostname,
+                    "ignoring tailnet identity for {{server.address}}, which is not a proxied route",
+                ),
             }
         }
-        Ok(())
     }
 }
 
@@ -1195,14 +1195,14 @@ mod tests {
             .route("app.example.org", "127.0.0.1:3000", Access::Private)
             .route("other.example.org", "127.0.0.1:4000", Access::Private)
             .identify_tailnet_users("App.Example.org");
-        proxy.apply_tailnet_identity().unwrap();
+        proxy.apply_tailnet_identity();
 
         assert!(identifies_tailnet_users(&proxy, "app.example.org"));
         assert!(!identifies_tailnet_users(&proxy, "other.example.org"));
     }
 
     #[test]
-    fn tailnet_identity_on_a_redirect_or_an_unknown_host_fails_at_startup() {
+    fn tailnet_identity_on_a_redirect_or_an_unknown_host_is_ignored() {
         let mut redirecting = HostProxy::new()
             .redirect("www.example.org", "example.org")
             .identify_tailnet_users("www.example.org");
@@ -1210,7 +1210,14 @@ mod tests {
             .route("app.example.org", "127.0.0.1:3000", Access::Private)
             .identify_tailnet_users("typo.example.org");
 
-        redirecting.apply_tailnet_identity().unwrap_err();
-        unknown.apply_tailnet_identity().unwrap_err();
+        redirecting.apply_tailnet_identity();
+        unknown.apply_tailnet_identity();
+
+        assert!(matches!(
+            redirecting.routes_by_hostname.get("www.example.org"),
+            Some(Route::Redirect { .. })
+        ));
+        assert!(!identifies_tailnet_users(&unknown, "app.example.org"));
+        assert!(!unknown.routes_by_hostname.contains_key("typo.example.org"));
     }
 }

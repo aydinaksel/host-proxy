@@ -1,6 +1,6 @@
 [package]
 name = "host-proxy"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 description = "A Pingora reverse proxy that routes by hostname, with per-SNI certificates, private and bearer-token routes, and zero-downtime reloads"
 license = "MIT"

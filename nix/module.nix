@@ -244,6 +244,7 @@ in
         RuntimeDirectory = "host-proxy";
         ExecStart = "${package}/bin/host-proxy --daemon --conf ${serverConfiguration}";
         ExecReload = [
+          "${package}/bin/host-proxy --test --conf ${serverConfiguration}"
           "${pkgs.coreutils}/bin/kill -QUIT $MAINPID"
           "${package}/bin/host-proxy --upgrade --daemon --conf ${serverConfiguration}"
         ];
