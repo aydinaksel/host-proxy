@@ -83,6 +83,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 async-trait = "0.1"
 http = "1"
+openssl = "0.10.81"
 # Pingora 0.9 builds every BufStream with zero capacity, which tokio 1.54 rejects:
 # https://github.com/cloudflare/pingora/issues/1059
 tokio = { version = ">=1, <1.54", features = ["io-util", "net", "signal", "time"] }

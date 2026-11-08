@@ -94,7 +94,7 @@ fn configure_and_run() -> Result<Infallible, HostProxyError> {
             return Err(HostProxyError::new(format!(
                 "invalid route entry {route_entry:?} in {ROUTES_ENVIRONMENT_VARIABLE}, \
                  expected hostname=address, hostname=address!private, \
-                 hostname=address!bearer=/path/to/tokens, hostname=address!tailnet-identity, or hostname=>redirecthost"
+                 hostname=address!bearer-sha256=/path/to/digests, hostname=address!tailnet-identity, or hostname=>redirecthost"
             )));
         };
 
@@ -105,13 +105,13 @@ fn configure_and_run() -> Result<Infallible, HostProxyError> {
             let upstream_address = tags.next().unwrap_or(target).trim();
 
             let mut access = Access::Public;
-            let mut token_file_path = None;
+            let mut token_digest_file_path = None;
             let mut identifies_tailnet_users = false;
 
             for tag in tags {
                 let tag = tag.trim();
-                if let Some(path) = tag.strip_prefix("bearer=") {
-                    token_file_path = Some(path.trim().to_string());
+                if let Some(path) = tag.strip_prefix("bearer-sha256=") {
+                    token_digest_file_path = Some(path.trim().to_string());
                 } else if tag == TAILNET_IDENTITY_TAG {
                     identifies_tailnet_users = true;
                 } else {
@@ -121,14 +121,14 @@ fn configure_and_run() -> Result<Infallible, HostProxyError> {
                         other => {
                             return Err(HostProxyError::new(format!(
                                 "unknown route tag {other:?}, expected 'private', 'public', \
-                                 'tailnet-identity', or 'bearer=/path/to/tokens'"
+                                 'tailnet-identity', or 'bearer-sha256=/path/to/digests'"
                             )));
                         }
                     };
                 }
             }
 
-            let routed = match token_file_path {
+            let routed = match token_digest_file_path {
                 Some(path) => {
                     proxy.authenticated_route(hostname.trim(), upstream_address, access, path)
                 }

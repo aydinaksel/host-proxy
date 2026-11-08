@@ -25,12 +25,14 @@ A route is one of:
     loopback, an RFC 1918 network, or the Tailscale CGNAT range (`100.64.0.0/10`)
     with a 403.
 -   **Authenticated proxy**, which additionally requires an
-    `Authorization: Bearer <token>` header matching one of the tokens in a file,
-    and answers 401 otherwise. Tokens are compared in constant time and the file
-    may list several, so a token can be rotated by adding the replacement,
-    moving every client over, and only then removing the old one. The file is
-    re-read on reload (see below) and on `SIGHUP`, so token changes take
-    effect without dropping connections. Suits
+    `Authorization: Bearer <token>` header whose token's SHA-256 digest is
+    listed in a file, and answers 401 otherwise. Only digests are configured,
+    so the file reveals no token and can live in public configuration; compute
+    one with `printf %s "$token" | sha256sum`. Digests are compared in constant
+    time and the file may list several, so a token can be rotated by adding the
+    replacement's digest, moving every client over, and only then removing the
+    old one. The file is re-read on reload (see below) and on `SIGHUP`, so
+    changes take effect without dropping connections. Suits
     machine-to-machine endpoints that must be publicly reachable; access and
     authentication compose, so a route can require both.
 Any proxied route can also **identify tailnet users**: host-proxy asks the
@@ -55,12 +57,12 @@ The `host-proxy` binary reads these environment variables:
 -   `HOST_PROXY_ROUTES`: comma-separated entries, each one of:
     -   `hostname=host:port` — public proxy.
     -   `hostname=host:port!private` — private proxy.
-    -   `hostname=host:port!bearer=/path/to/tokens` — authenticated proxy.
+    -   `hostname=host:port!bearer-sha256=/path/to/digests` — authenticated proxy.
     -   `hostname=host:port!tailnet-identity` — proxy that identifies tailnet
         users.
     -   `hostname=>targethost` — permanent redirect to `https://targethost`.
 
-    Tags combine, so `hostname=host:port!private!bearer=/path/to/tokens`
+    Tags combine, so `hostname=host:port!private!bearer-sha256=/path/to/digests`
     requires both a private client address and a valid token.
 
     For example:
@@ -97,7 +99,7 @@ services.hostProxy = {
     "admin.example.org" = { upstreamAddress = "127.0.0.1:4000"; access = "private"; };
     "ingest.example.org" = {
       upstreamAddress = "127.0.0.1:5000";
-      bearerTokenFile = "/run/secrets/ingest-tokens";
+      bearerTokenDigests = [ "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" ];
     };
     "tools.example.org" = {
       upstreamAddress = "127.0.0.1:6000";
@@ -124,18 +126,18 @@ Pingora's graceful upgrade: a new process starts, takes over the listening
 sockets from the old one, and the old process finishes its in-flight requests
 before exiting. No connection is dropped, and the new process picks up
 everything: a new binary, changed routes, renewed certificates, and rotated
-bearer tokens. The NixOS module marks the unit `reloadIfChanged`, so
+bearer token digests. The NixOS module marks the unit `reloadIfChanged`, so
 `nixos-rebuild switch` upgrades the running proxy the same way, and ACME's
 `reloadServices` picks up renewed certificates through it.
 
 Before it touches the running process, a reload starts the new one with
-`--test`, which loads the routes, certificates, and token files exactly as a
+`--test`, which loads the routes, certificates, and digest files exactly as a
 real start would and exits without listening. If that fails, the reload fails
-and the old process keeps serving, so a bad certificate or an empty token file
+and the old process keeps serving, so a bad certificate or an empty digest file
 never takes the proxy down.
 
-Sending `SIGHUP` directly to the process re-reads only the bearer token files
-in place, without replacing the process.
+Sending `SIGHUP` directly to the process re-reads only the bearer token digest
+files in place, without replacing the process.
 
 ## License
 

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use http::uri::PathAndQuery;
+use openssl::sha::sha256;
 use pingora::http::ResponseHeader;
 use pingora::listeners::tls::TlsSettings;
 use pingora::listeners::TcpSocketOptions;
@@ -102,67 +103,101 @@ fn is_private_client(address: IpAddr) -> bool {
     }
 }
 
-/// Bearer tokens accepted on a route. Holding several lets a token be rotated
-/// by adding the new one, redeploying every client, and only then removing the
-/// old one. The set is reloaded from its file on SIGHUP, so rotation needs no
-/// restart and no dropped connections.
+const SHA256_DIGEST_LENGTH_BYTES: usize = 32;
+const SHA256_HEXADECIMAL_LENGTH: usize = 64;
+
+type TokenDigest = [u8; SHA256_DIGEST_LENGTH_BYTES];
+
+/// SHA-256 digests of the bearer tokens accepted on a route. Only digests are
+/// configured, so the accepted set reveals no token and can live in public
+/// configuration. Holding several lets a token be rotated by adding the new
+/// digest, redeploying every client, and only then removing the old one. The
+/// set is reloaded from its file on SIGHUP, so rotation needs no restart and no
+/// dropped connections.
 #[derive(Clone)]
-pub struct BearerTokens {
-    token_file_path: Arc<str>,
-    tokens: Arc<RwLock<Vec<String>>>,
+pub struct BearerTokenDigests {
+    digest_file_path: Arc<str>,
+    digests: Arc<RwLock<Vec<TokenDigest>>>,
 }
 
-fn read_tokens(token_file_path: &str) -> Result<Vec<String>, String> {
-    let contents = fs::read_to_string(token_file_path)
-        .map_err(|error| format!("failed to read {token_file_path}: {error}"))?;
+fn parse_hexadecimal_digest(line: &str) -> Option<TokenDigest> {
+    let is_hexadecimal_digest = line.len() == SHA256_HEXADECIMAL_LENGTH
+        && line.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if !is_hexadecimal_digest {
+        return None;
+    }
 
-    let tokens: Vec<String> = contents
+    let bytes: Option<Vec<u8>> = line
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .ok()
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+        })
+        .collect();
+    bytes.and_then(|bytes| TokenDigest::try_from(bytes.as_slice()).ok())
+}
+
+fn read_digests(digest_file_path: &str) -> Result<Vec<TokenDigest>, String> {
+    let contents = fs::read_to_string(digest_file_path)
+        .map_err(|error| format!("failed to read {digest_file_path}: {error}"))?;
+
+    let digests: Option<Vec<TokenDigest>> = contents
         .lines()
-        .map(|line| line.trim().to_string())
+        .map(str::trim)
         .filter(|line| !line.is_empty())
+        .map(parse_hexadecimal_digest)
         .collect();
 
-    if tokens.is_empty() {
+    let Some(digests) = digests else {
         return Err(format!(
-            "bearer token file {token_file_path} contains no tokens"
+            "bearer token digest file {digest_file_path} has a line that is not a \
+             {SHA256_HEXADECIMAL_LENGTH}-character hexadecimal SHA-256 digest"
+        ));
+    };
+
+    if digests.is_empty() {
+        return Err(format!(
+            "bearer token digest file {digest_file_path} contains no digests"
         ));
     }
 
-    Ok(tokens)
+    Ok(digests)
 }
 
-impl BearerTokens {
-    fn load(token_file_path: &str) -> Result<Self, HostProxyError> {
-        let tokens = read_tokens(token_file_path).map_err(|error| {
-            HostProxyError::new(format!("failed to load bearer tokens: {error}"))
+impl BearerTokenDigests {
+    fn load(digest_file_path: &str) -> Result<Self, HostProxyError> {
+        let digests = read_digests(digest_file_path).map_err(|error| {
+            HostProxyError::new(format!("failed to load bearer token digests: {error}"))
         })?;
 
-        Ok(BearerTokens {
-            token_file_path: Arc::from(token_file_path),
-            tokens: Arc::new(RwLock::new(tokens)),
+        Ok(BearerTokenDigests {
+            digest_file_path: Arc::from(digest_file_path),
+            digests: Arc::new(RwLock::new(digests)),
         })
     }
 
     fn reload(&self) {
-        match read_tokens(&self.token_file_path) {
-            Ok(reloaded_tokens) => {
-                let token_count = reloaded_tokens.len();
-                *self.tokens.write().unwrap_or_else(PoisonError::into_inner) = reloaded_tokens;
+        match read_digests(&self.digest_file_path) {
+            Ok(reloaded_digests) => {
+                let digest_count = reloaded_digests.len();
+                *self.digests.write().unwrap_or_else(PoisonError::into_inner) = reloaded_digests;
                 event!(
                     name: "proxy.tokens.reloaded",
                     Level::INFO,
-                    file.path = &*self.token_file_path,
-                    token.count = token_count,
-                    "reloaded {{token.count}} bearer tokens from {{file.path}}",
+                    file.path = &*self.digest_file_path,
+                    token.count = digest_count,
+                    "reloaded {{token.count}} bearer token digests from {{file.path}}",
                 );
             }
             Err(error) => {
                 event!(
                     name: "proxy.tokens.reload_failed",
                     Level::ERROR,
-                    file.path = &*self.token_file_path,
+                    file.path = &*self.digest_file_path,
                     error.message = error,
-                    "keeping existing bearer tokens, failed to reload {{file.path}}: {{error.message}}",
+                    "keeping existing bearer token digests, failed to reload {{file.path}}: {{error.message}}",
                 );
             }
         }
@@ -174,15 +209,16 @@ impl BearerTokens {
                   which of the accepted tokens was presented"
     )]
     fn accepts(&self, presented_token: &str) -> bool {
-        let tokens = self.tokens.read().unwrap_or_else(PoisonError::into_inner);
-        tokens.iter().fold(false, |accepted, token| {
-            constant_time_equals(token.as_bytes(), presented_token.as_bytes()) || accepted
+        let presented_digest = sha256(presented_token.as_bytes());
+        let digests = self.digests.read().unwrap_or_else(PoisonError::into_inner);
+        digests.iter().fold(false, |accepted, digest| {
+            constant_time_equals(digest, &presented_digest) || accepted
         })
     }
 }
 
 struct TokenReloadService {
-    reloadable_tokens: Vec<BearerTokens>,
+    reloadable_digests: Vec<BearerTokenDigests>,
 }
 
 #[async_trait]
@@ -205,8 +241,8 @@ impl BackgroundService for TokenReloadService {
                         Level::INFO,
                         "received SIGHUP, reloading bearer tokens",
                     );
-                    for tokens in &self.reloadable_tokens {
-                        tokens.reload();
+                    for digests in &self.reloadable_digests {
+                        digests.reload();
                     }
                 }
                 _ = shutdown.changed() => return,
@@ -404,7 +440,7 @@ enum Route {
     Proxy {
         upstream_address: String,
         access: Access,
-        bearer_token_file_path: Option<String>,
+        bearer_token_digest_file_path: Option<String>,
         identifies_tailnet_users: bool,
     },
     Redirect {
@@ -416,7 +452,7 @@ enum LoadedRoute {
     Proxy {
         upstream_address: String,
         access: Access,
-        bearer_tokens: Option<BearerTokens>,
+        bearer_token_digests: Option<BearerTokenDigests>,
         identifies_tailnet_users: bool,
     },
     Redirect {
@@ -430,7 +466,7 @@ impl Route {
             Route::Proxy {
                 upstream_address,
                 access,
-                bearer_token_file_path,
+                bearer_token_digest_file_path,
                 identifies_tailnet_users,
             } => {
                 let access_label = match access {
@@ -443,7 +479,7 @@ impl Route {
                     server.address = hostname,
                     upstream.address = upstream_address,
                     route.access = access_label,
-                    route.authenticated = bearer_token_file_path.is_some(),
+                    route.authenticated = bearer_token_digest_file_path.is_some(),
                     route.tailnet_identity = identifies_tailnet_users,
                     "routing {{server.address}} to {{upstream.address}} ({{route.access}}, authenticated={{route.authenticated}}, tailnet_identity={{route.tailnet_identity}})",
                 );
@@ -465,16 +501,16 @@ impl Route {
             Route::Proxy {
                 upstream_address,
                 access,
-                bearer_token_file_path,
+                bearer_token_digest_file_path,
                 identifies_tailnet_users,
             } => {
-                let bearer_tokens = bearer_token_file_path
-                    .map(|token_file_path| BearerTokens::load(&token_file_path))
+                let bearer_token_digests = bearer_token_digest_file_path
+                    .map(|digest_file_path| BearerTokenDigests::load(&digest_file_path))
                     .transpose()?;
                 Ok(LoadedRoute::Proxy {
                     upstream_address,
                     access,
-                    bearer_tokens,
+                    bearer_token_digests,
                     identifies_tailnet_users,
                 })
             }
@@ -538,7 +574,7 @@ impl HostProxy {
             Route::Proxy {
                 upstream_address: upstream_address.into(),
                 access,
-                bearer_token_file_path: None,
+                bearer_token_digest_file_path: None,
                 identifies_tailnet_users: false,
             },
         );
@@ -546,7 +582,8 @@ impl HostProxy {
     }
 
     /// Route requests only when they carry `Authorization: Bearer <token>` with
-    /// a token listed in `token_file_path`, one per line. Unauthenticated
+    /// a token whose SHA-256 digest is listed in `token_digest_file_path`, one
+    /// 64-character hexadecimal digest per line. Unauthenticated
     /// requests receive a 401 and never reach the upstream, so this suits
     /// machine-to-machine endpoints that must be publicly reachable. The file is
     /// read when [`HostProxy::run`] starts and reloaded on SIGHUP, so tokens
@@ -557,14 +594,14 @@ impl HostProxy {
         hostname: impl Into<String>,
         upstream_address: impl Into<String>,
         access: Access,
-        token_file_path: impl Into<String>,
+        token_digest_file_path: impl Into<String>,
     ) -> Self {
         self.routes_by_hostname.insert(
             hostname.into().to_ascii_lowercase(),
             Route::Proxy {
                 upstream_address: upstream_address.into(),
                 access,
-                bearer_token_file_path: Some(token_file_path.into()),
+                bearer_token_digest_file_path: Some(token_digest_file_path.into()),
                 identifies_tailnet_users: false,
             },
         );
@@ -624,16 +661,16 @@ impl HostProxy {
         self.apply_tailnet_identity();
 
         let mut loaded_routes_by_hostname = HashMap::new();
-        let mut reloadable_tokens = Vec::new();
+        let mut reloadable_digests = Vec::new();
         for (hostname, route) in self.routes_by_hostname {
             route.log_configured(&hostname);
             let loaded_route = route.load()?;
             if let LoadedRoute::Proxy {
-                bearer_tokens: Some(bearer_tokens),
+                bearer_token_digests: Some(bearer_token_digests),
                 ..
             } = &loaded_route
             {
-                reloadable_tokens.push(bearer_tokens.clone());
+                reloadable_digests.push(bearer_token_digests.clone());
             }
             loaded_routes_by_hostname.insert(hostname, loaded_route);
         }
@@ -711,7 +748,7 @@ impl HostProxy {
 
         server.add_service(background_service(
             "bearer token reload",
-            TokenReloadService { reloadable_tokens },
+            TokenReloadService { reloadable_digests },
         ));
 
         server.run_forever()
@@ -918,7 +955,8 @@ impl ProxyHttp for HostRouter {
 
         context.routed_hostname = Some(hostname.clone());
 
-        let (upstream_address, access, bearer_tokens, identifies_tailnet_users) = match route {
+        let (upstream_address, access, bearer_token_digests, identifies_tailnet_users) = match route
+        {
             LoadedRoute::Redirect { target_host } => {
                 let redirect_location =
                     format!("https://{target_host}{}", requested_path_and_query(session));
@@ -928,12 +966,12 @@ impl ProxyHttp for HostRouter {
             LoadedRoute::Proxy {
                 upstream_address,
                 access,
-                bearer_tokens,
+                bearer_token_digests,
                 identifies_tailnet_users,
             } => (
                 upstream_address,
                 *access,
-                bearer_tokens.as_ref(),
+                bearer_token_digests.as_ref(),
                 *identifies_tailnet_users,
             ),
         };
@@ -957,7 +995,7 @@ impl ProxyHttp for HostRouter {
             }
         }
 
-        if let Some(accepted_tokens) = bearer_tokens {
+        if let Some(accepted_digests) = bearer_token_digests {
             let presented_token = session
                 .req_header()
                 .headers
@@ -966,7 +1004,7 @@ impl ProxyHttp for HostRouter {
                 .and_then(|header_value| header_value.strip_prefix("Bearer "));
 
             let is_authenticated =
-                presented_token.is_some_and(|token| accepted_tokens.accepts(token.trim()));
+                presented_token.is_some_and(|token| accepted_digests.accepts(token.trim()));
 
             if !is_authenticated {
                 event!(
@@ -1106,7 +1144,10 @@ mod tests {
     use std::net::IpAddr;
     use std::sync::{Arc, RwLock};
 
-    use super::{constant_time_equals, is_private_client, Access, BearerTokens, HostProxy, Route};
+    use super::{
+        constant_time_equals, is_private_client, parse_hexadecimal_digest, sha256, Access,
+        BearerTokenDigests, HostProxy, Route,
+    };
 
     fn parsed(address: &str) -> IpAddr {
         address.parse().expect("invalid test address")
@@ -1137,11 +1178,30 @@ mod tests {
         assert!(!is_private_client(parsed("::ffff:8.8.8.8")));
     }
 
-    fn tokens(values: &[&str]) -> BearerTokens {
-        BearerTokens {
-            token_file_path: Arc::from("test-tokens"),
-            tokens: Arc::new(RwLock::new(
-                values.iter().map(ToString::to_string).collect(),
+    fn hexadecimal_digest(token: &str) -> String {
+        sha256(token.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<String>>()
+            .concat()
+    }
+
+    fn digest_file_contents(tokens: &[&str]) -> String {
+        tokens
+            .iter()
+            .map(|token| hexadecimal_digest(token) + "\n")
+            .collect::<Vec<String>>()
+            .concat()
+    }
+
+    fn digests_of(tokens: &[&str]) -> BearerTokenDigests {
+        BearerTokenDigests {
+            digest_file_path: Arc::from("test-digests"),
+            digests: Arc::new(RwLock::new(
+                tokens
+                    .iter()
+                    .map(|token| sha256(token.as_bytes()))
+                    .collect(),
             )),
         }
     }
@@ -1156,34 +1216,76 @@ mod tests {
     }
 
     #[test]
-    fn accepts_any_configured_token() {
-        let accepted = tokens(&["first-token", "second-token"]);
+    fn accepts_any_token_whose_digest_is_configured() {
+        let accepted = digests_of(&["first-token", "second-token"]);
         assert!(accepted.accepts("first-token"));
         assert!(accepted.accepts("second-token"));
     }
 
     #[test]
     fn rejects_unknown_and_partial_tokens() {
-        let accepted = tokens(&["first-token"]);
+        let accepted = digests_of(&["first-token"]);
         assert!(!accepted.accepts("wrong-token"));
         assert!(!accepted.accepts("first"));
         assert!(!accepted.accepts("first-token-extra"));
         assert!(!accepted.accepts(""));
     }
 
-    fn temporary_token_file(contents: &str, label: &str) -> std::path::PathBuf {
+    #[test]
+    fn rejects_the_digest_presented_as_a_token() {
+        let accepted = digests_of(&["first-token"]);
+        assert!(!accepted.accepts(&hexadecimal_digest("first-token")));
+    }
+
+    #[test]
+    fn parses_only_64_character_hexadecimal_digests() {
+        let digest = hexadecimal_digest("first-token");
+        assert_eq!(
+            parse_hexadecimal_digest(&digest),
+            Some(sha256(b"first-token"))
+        );
+        assert_eq!(
+            parse_hexadecimal_digest(&digest.to_ascii_uppercase()),
+            Some(sha256(b"first-token"))
+        );
+        let digest_without_first_character: String = digest.chars().skip(1).collect();
+        assert_eq!(
+            parse_hexadecimal_digest(&digest_without_first_character),
+            None
+        );
+        assert_eq!(parse_hexadecimal_digest(&format!("{digest}0")), None);
+        assert_eq!(
+            parse_hexadecimal_digest(&format!("+{digest_without_first_character}")),
+            None
+        );
+        assert_eq!(
+            parse_hexadecimal_digest(&format!("g{digest_without_first_character}")),
+            None
+        );
+        assert_eq!(parse_hexadecimal_digest("first-token"), None);
+    }
+
+    fn temporary_digest_file(contents: &str, label: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("host-proxy-{}-{label}", std::process::id()));
-        std::fs::write(&path, contents).expect("failed to write temporary token file");
+        std::fs::write(&path, contents).expect("failed to write temporary digest file");
         path
     }
 
     #[test]
+    fn load_rejects_a_file_holding_a_plain_token() {
+        let path = temporary_digest_file("first-token\n", "load-plain-token");
+        assert!(BearerTokenDigests::load(path.to_str().unwrap()).is_err());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn reload_swaps_the_accepted_token_set() {
-        let path = temporary_token_file("first-token\n", "reload-swap");
-        let accepted = BearerTokens::load(path.to_str().unwrap()).unwrap();
+        let path = temporary_digest_file(&digest_file_contents(&["first-token"]), "reload-swap");
+        let accepted = BearerTokenDigests::load(path.to_str().unwrap()).unwrap();
         assert!(accepted.accepts("first-token"));
 
-        std::fs::write(&path, "second-token\n").unwrap();
+        std::fs::write(&path, digest_file_contents(&["second-token"])).unwrap();
         accepted.reload();
 
         assert!(accepted.accepts("second-token"));
@@ -1193,14 +1295,29 @@ mod tests {
     }
 
     #[test]
-    fn reload_keeps_existing_tokens_when_the_new_file_is_empty() {
-        let path = temporary_token_file("only-token\n", "reload-empty");
-        let accepted = BearerTokens::load(path.to_str().unwrap()).unwrap();
+    fn reload_keeps_existing_digests_when_the_new_file_is_empty() {
+        let path = temporary_digest_file(&digest_file_contents(&["only-token"]), "reload-empty");
+        let accepted = BearerTokenDigests::load(path.to_str().unwrap()).unwrap();
 
         std::fs::write(&path, "\n   \n").unwrap();
         accepted.reload();
 
         assert!(accepted.accepts("only-token"));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn reload_keeps_existing_digests_when_the_new_file_holds_a_plain_token() {
+        let path =
+            temporary_digest_file(&digest_file_contents(&["only-token"]), "reload-plain-token");
+        let accepted = BearerTokenDigests::load(path.to_str().unwrap()).unwrap();
+
+        std::fs::write(&path, "second-token\n").unwrap();
+        accepted.reload();
+
+        assert!(accepted.accepts("only-token"));
+        assert!(!accepted.accepts("second-token"));
 
         std::fs::remove_file(&path).unwrap();
     }

@@ -16,7 +16,15 @@ let
       else
         let
           accessTag = if route.access == "private" then "!private" else "";
-          bearerTag = if route.bearerTokenFile != null then "!bearer=${route.bearerTokenFile}" else "";
+          bearerTag =
+            if route.bearerTokenDigests != null then
+              "!bearer-sha256=${
+                pkgs.writeText "host-proxy-${hostname}-bearer-token-digests" (
+                  lib.concatLines route.bearerTokenDigests
+                )
+              }"
+            else
+              "";
           tailnetIdentityTag = if route.identifyTailnetUsers then "!tailnet-identity" else "";
         in
         "${hostname}=${route.upstreamAddress}${accessTag}${bearerTag}${tailnetIdentityTag}"
@@ -76,18 +84,22 @@ in
                 RFC 1918, and Tailscale CGNAT addresses. Ignored for redirects.
               '';
             };
-            bearerTokenFile = lib.mkOption {
-              type = lib.types.nullOr lib.types.str;
+            bearerTokenDigests = lib.mkOption {
+              type = lib.types.nullOr (
+                lib.types.nonEmptyListOf (lib.types.strMatching "[0-9a-fA-F]{64}")
+              );
               default = null;
+              example = [ "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" ];
               description = ''
-                Path to a file of accepted bearer tokens, one per line. When set,
-                requests must carry a matching Authorization: Bearer header or
-                receive a 401 without reaching the upstream. Listing several
-                tokens allows rotation without downtime. `systemctl reload
-                host-proxy` hands the listening sockets to a fresh process that
-                re-reads the file, and SIGHUP re-reads it in place, so token
-                changes take effect without dropping connections. Ignored for
-                redirects.
+                SHA-256 digests of the accepted bearer tokens, as 64-character
+                hexadecimal strings. When set, requests must carry an
+                Authorization: Bearer header whose token hashes to one of them,
+                or receive a 401 without reaching the upstream. Only digests are
+                configured, so they reveal no token and can live in public
+                configuration. Compute one with `printf %s "$token" | sha256sum`.
+                Listing several allows rotation without downtime, and a change
+                takes effect through `systemctl reload host-proxy` without
+                dropping connections. Ignored for redirects.
               '';
             };
             identifyTailnetUsers = lib.mkOption {
@@ -191,9 +203,9 @@ in
         '';
       }) hostProxyConfiguration.routes
       ++ lib.mapAttrsToList (hostname: route: {
-        assertion = route.bearerTokenFile == null || route.redirectTo == null;
+        assertion = route.bearerTokenDigests == null || route.redirectTo == null;
         message = ''
-          services.hostProxy.routes."${hostname}" sets bearerTokenFile on a
+          services.hostProxy.routes."${hostname}" sets bearerTokenDigests on a
           redirect, which is never authenticated. Remove one of them.
         '';
       }) hostProxyConfiguration.routes
