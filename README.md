@@ -1,40 +1,40 @@
-# Host proxy
+# Host Proxy
 
 A [Pingora](https://github.com/cloudflare/pingora) reverse proxy that owns
 ports 80 and 443 on a host and routes requests to upstream services by
 hostname. One instance runs per public-facing server; the route table is
 configuration, so the same binary serves every host.
 
--   Port 443 terminates TLS and selects a certificate per connection by SNI, so
-    you can load several certificates and each must merely cover the hostnames
-    it serves.
--   Port 80 only redirects to HTTPS.
--   Both ports listen on IPv4 and IPv6. IPv6 clients only arrive once the
-    routed hostnames publish AAAA records; without them nothing changes.
-    Private routes accept IPv6 loopback and unique local addresses
-    (`fc00::/7`, which covers Tailscale's IPv6 range).
--   Hostname matching is exact. Requests for unrouted hosts receive a 404 and
-    never reach an upstream.
+- Port 443 terminates TLS and selects a certificate per connection by SNI, so
+  you can load several certificates and each must merely cover the hostnames
+  it serves.
+- Port 80 only redirects to HTTPS.
+- Both ports listen on IPv4 and IPv6. IPv6 clients only arrive once the
+  routed hostnames publish AAAA records; without them nothing changes.
+  Private routes accept IPv6 loopback and unique local addresses
+  (`fc00::/7`, which covers Tailscale's IPv6 range).
+- Hostname matching is exact. Requests for unrouted hosts receive a 404 and
+  never reach an upstream.
 
-## Route kinds
+## Route Kinds
 
 A route is one of:
 
--   **Proxy** the request to an upstream `host:port`.
--   **Private proxy**, which additionally rejects clients that are not on
-    loopback, an RFC 1918 network, or the Tailscale CGNAT range (`100.64.0.0/10`)
-    with a 403.
--   **Authenticated proxy**, which additionally requires an
-    `Authorization: Bearer <token>` header whose token's SHA-256 digest is
-    listed in a file, and answers 401 otherwise. Only digests are configured,
-    so the file reveals no token and can live in public configuration; compute
-    one with `printf %s "$token" | sha256sum`. Digests are compared in constant
-    time and the file may list several, so a token can be rotated by adding the
-    replacement's digest, moving every client over, and only then removing the
-    old one. The file is re-read on reload (see below) and on `SIGHUP`, so
-    changes take effect without dropping connections. Suits
-    machine-to-machine endpoints that must be publicly reachable; access and
-    authentication compose, so a route can require both.
+- **Proxy** the request to an upstream `host:port`.
+- **Private proxy**, which additionally rejects clients that are not on
+  loopback, an RFC 1918 network, or the Tailscale CGNAT range (`100.64.0.0/10`)
+  with a 403.
+- **Authenticated proxy**, which additionally requires an
+  `Authorization: Bearer <token>` header whose token's SHA-256 digest is
+  listed in a file, and answers 401 otherwise. Only digests are configured,
+  so the file reveals no token and can live in public configuration; compute
+  one with `printf %s "$token" | sha256sum`. Digests are compared in constant
+  time and the file may list several, so a token can be rotated by adding the
+  replacement's digest, moving every client over, and only then removing the
+  old one. The file is re-read on reload (see below) and on `SIGHUP`, so
+  changes take effect without dropping connections. Suits
+  machine-to-machine endpoints that must be publicly reachable; access and
+  authentication compose, so a route can require both.
 Any proxied route can also **identify tailnet users**: host-proxy asks the
 local tailscaled which tailnet user each client is, through its `whois` API, and
 passes the answer upstream in `X-Tailnet-User-Login` and `X-Tailnet-User-Name`.
@@ -44,48 +44,47 @@ the headers rather than refused. Every route strips those headers from client
 requests, whether or not it identifies anyone, so an upstream can trust them.
 A host with no identifying route never contacts tailscaled. Pair it with a
 private route so only tailnet clients reach the upstream at all.
-
--   **Redirect**, which answers `301` with `Location: https://<target><path>`.
-    TLS still terminates here, so a certificate covering the redirected
-    hostname is required. The target is fixed configuration and is never taken
-    from the request, so it cannot become an open redirect.
+- **Redirect**, which answers `301` with `Location: https://<target><path>`.
+  TLS still terminates here, so a certificate covering the redirected
+  hostname is required. The target is fixed configuration and is never taken
+  from the request, so it cannot become an open redirect.
 
 ## Configuration
 
 The `host-proxy` binary reads these environment variables:
 
--   `HOST_PROXY_ROUTES`: comma-separated entries, each one of:
-    -   `hostname=host:port` — public proxy.
-    -   `hostname=host:port!private` — private proxy.
-    -   `hostname=host:port!bearer-sha256=/path/to/digests` — authenticated proxy.
-    -   `hostname=host:port!tailnet-identity` — proxy that identifies tailnet
-        users.
-    -   `hostname=>targethost` — permanent redirect to `https://targethost`.
+- `HOST_PROXY_ROUTES`: comma-separated entries, each one of:
+  - `hostname=host:port` — public proxy.
+  - `hostname=host:port!private` — private proxy.
+  - `hostname=host:port!bearer-sha256=/path/to/digests` — authenticated proxy.
+  - `hostname=host:port!tailnet-identity` — proxy that identifies tailnet
+    users.
+  - `hostname=>targethost` — permanent redirect to `https://targethost`.
 
-    Tags combine, so `hostname=host:port!private!bearer-sha256=/path/to/digests`
-    requires both a private client address and a valid token.
+  Tags combine, so `hostname=host:port!private!bearer-sha256=/path/to/digests`
+  requires both a private client address and a valid token.
 
-    For example:
-    `example.org=127.0.0.1:3000,admin.example.org=127.0.0.1:4000!private,www.example.org=>example.org`
--   `HOST_PROXY_CERTIFICATES`: comma-separated `certificate_path:private_key_path`
-    pairs, one per certificate to load.
--   `HOST_PROXY_RATE_LIMIT_PER_SECOND` (optional): maximum requests per second
-    accepted from a single client IP address. Clients over the limit receive a
-    429 with `Retry-After: 1` before any routing or authentication work
-    happens. Unset means no rate limiting; the NixOS module defaults to 100.
--   `HOST_PROXY_HTTPS_ADDRESSES` and `HOST_PROXY_HTTP_ADDRESSES` (optional):
-    comma-separated `host:port` addresses to listen on for HTTPS and for the
-    HTTP redirect. Default to `0.0.0.0:443,[::]:443` and `0.0.0.0:80,[::]:80`.
--   `HOST_PROXY_TAILSCALED_SOCKET` (optional): the tailscaled socket that
-    identifying routes ask. Defaults to `/run/tailscale/tailscaled.sock`.
--   `HOST_PROXY_METRICS_ADDRESS` (optional): `host:port` to serve Prometheus
-    metrics on, e.g. `127.0.0.1:9184`. The endpoint carries no authentication
-    of its own, so bind it to loopback or a private interface. Alongside the
-    process metrics, `host_proxy_http_requests_total` counts requests by
-    routed hostname and response status, and
-    `host_proxy_rate_limited_requests_total` counts 429s from the rate limit.
-    Every request is also logged as a structured `proxy.request.completed`
-    event with method, hostname, path, status, and client address.
+  For example:
+  `example.org=127.0.0.1:3000,admin.example.org=127.0.0.1:4000!private,www.example.org=>example.org`
+- `HOST_PROXY_CERTIFICATES`: comma-separated `certificate_path:private_key_path`
+  pairs, one per certificate to load.
+- `HOST_PROXY_RATE_LIMIT_PER_SECOND` (optional): maximum requests per second
+  accepted from a single client IP address. Clients over the limit receive a
+  429 with `Retry-After: 1` before any routing or authentication work
+  happens. Unset means no rate limiting; the NixOS module defaults to 100.
+- `HOST_PROXY_HTTPS_ADDRESSES` and `HOST_PROXY_HTTP_ADDRESSES` (optional):
+  comma-separated `host:port` addresses to listen on for HTTPS and for the
+  HTTP redirect. Default to `0.0.0.0:443,[::]:443` and `0.0.0.0:80,[::]:80`.
+- `HOST_PROXY_TAILSCALED_SOCKET` (optional): the tailscaled socket that
+  identifying routes ask. Defaults to `/run/tailscale/tailscaled.sock`.
+- `HOST_PROXY_METRICS_ADDRESS` (optional): `host:port` to serve Prometheus
+  metrics on, e.g. `127.0.0.1:9184`. The endpoint carries no authentication
+  of its own, so bind it to loopback or a private interface. Alongside the
+  process metrics, `host_proxy_http_requests_total` counts requests by
+  routed hostname and response status, and
+  `host_proxy_rate_limited_requests_total` counts 429s from the rate limit.
+  Every request is also logged as a structured `proxy.request.completed`
+  event with method, hostname, path, status, and client address.
 
 ## NixOS
 
@@ -119,7 +118,7 @@ services.hostProxy = {
 
 Each route sets exactly one of `upstreamAddress` or `redirectTo`.
 
-## Reloads and zero-downtime upgrades
+## Reloads and Zero-Downtime Upgrades
 
 `systemctl reload host-proxy` performs a full zero-downtime replacement using
 Pingora's graceful upgrade: a new process starts, takes over the listening
