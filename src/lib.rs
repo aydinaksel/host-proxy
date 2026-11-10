@@ -28,9 +28,11 @@ use pingora_limits::rate::Rate;
 use pingora_prometheus::prometheus::{self, IntCounter, IntCounterVec};
 use tracing::{event, Level};
 
+pub use crate::client_networks::{ClientNetwork, InvalidClientNetwork};
 pub use crate::tailnet::DEFAULT_TAILSCALED_SOCKET_PATH;
 use crate::tailnet::{TailnetIdentity, TailnetWhois};
 
+mod client_networks;
 mod tailnet;
 
 const NEGOTIATED_ALPN_PROTOCOLS: &[u8] = b"\x02h2\x08http/1.1";
@@ -442,6 +444,7 @@ enum Route {
         access: Access,
         bearer_token_digest_file_path: Option<String>,
         identifies_tailnet_users: bool,
+        allowed_client_networks: Option<Vec<ClientNetwork>>,
     },
     Redirect {
         target_host: String,
@@ -454,6 +457,7 @@ enum LoadedRoute {
         access: Access,
         bearer_token_digests: Option<BearerTokenDigests>,
         identifies_tailnet_users: bool,
+        allowed_client_networks: Option<Vec<ClientNetwork>>,
     },
     Redirect {
         target_host: String,
@@ -468,7 +472,18 @@ impl Route {
                 access,
                 bearer_token_digest_file_path,
                 identifies_tailnet_users,
+                allowed_client_networks,
             } => {
+                let client_networks_label = allowed_client_networks.as_ref().map_or_else(
+                    || "any".to_string(),
+                    |networks| {
+                        networks
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    },
+                );
                 let access_label = match access {
                     Access::Public => "public",
                     Access::Private => "private",
@@ -481,7 +496,8 @@ impl Route {
                     route.access = access_label,
                     route.authenticated = bearer_token_digest_file_path.is_some(),
                     route.tailnet_identity = identifies_tailnet_users,
-                    "routing {{server.address}} to {{upstream.address}} ({{route.access}}, authenticated={{route.authenticated}}, tailnet_identity={{route.tailnet_identity}})",
+                    route.client_networks = client_networks_label,
+                    "routing {{server.address}} to {{upstream.address}} ({{route.access}}, authenticated={{route.authenticated}}, tailnet_identity={{route.tailnet_identity}}, client_networks={{route.client_networks}})",
                 );
             }
             Route::Redirect { target_host } => {
@@ -503,6 +519,7 @@ impl Route {
                 access,
                 bearer_token_digest_file_path,
                 identifies_tailnet_users,
+                allowed_client_networks,
             } => {
                 let bearer_token_digests = bearer_token_digest_file_path
                     .map(|digest_file_path| BearerTokenDigests::load(&digest_file_path))
@@ -512,6 +529,7 @@ impl Route {
                     access,
                     bearer_token_digests,
                     identifies_tailnet_users,
+                    allowed_client_networks,
                 })
             }
             Route::Redirect { target_host } => Ok(LoadedRoute::Redirect { target_host }),
@@ -525,6 +543,7 @@ pub struct HostProxy {
     rate_limit_per_second: Option<u32>,
     metrics_address: Option<String>,
     tailnet_identity_hostnames: HashSet<String>,
+    client_networks_by_hostname: HashMap<String, Vec<ClientNetwork>>,
     tailscaled_socket_path: String,
     https_addresses: Vec<String>,
     http_addresses: Vec<String>,
@@ -539,6 +558,7 @@ impl HostProxy {
             rate_limit_per_second: None,
             metrics_address: None,
             tailnet_identity_hostnames: HashSet::new(),
+            client_networks_by_hostname: HashMap::new(),
             tailscaled_socket_path: DEFAULT_TAILSCALED_SOCKET_PATH.to_string(),
             https_addresses: DEFAULT_HTTPS_ADDRESSES.map(str::to_string).to_vec(),
             http_addresses: DEFAULT_HTTP_ADDRESSES.map(str::to_string).to_vec(),
@@ -576,6 +596,7 @@ impl HostProxy {
                 access,
                 bearer_token_digest_file_path: None,
                 identifies_tailnet_users: false,
+                allowed_client_networks: None,
             },
         );
         self
@@ -603,6 +624,7 @@ impl HostProxy {
                 access,
                 bearer_token_digest_file_path: Some(token_digest_file_path.into()),
                 identifies_tailnet_users: false,
+                allowed_client_networks: None,
             },
         );
         self
@@ -627,6 +649,21 @@ impl HostProxy {
     pub fn identify_tailnet_users(mut self, hostname: impl Into<String>) -> Self {
         self.tailnet_identity_hostnames
             .insert(hostname.into().to_ascii_lowercase());
+        self
+    }
+
+    /// Accept requests for `hostname` only from clients inside one of
+    /// `networks`, answering 403 to everyone else before authentication or
+    /// proxying. Suits a public route that only a known service, such as a
+    /// provider's published outbound ranges, should ever call.
+    #[must_use]
+    pub fn allow_clients_from(
+        mut self,
+        hostname: impl Into<String>,
+        networks: Vec<ClientNetwork>,
+    ) -> Self {
+        self.client_networks_by_hostname
+            .insert(hostname.into().to_ascii_lowercase(), networks);
         self
     }
 
@@ -659,6 +696,7 @@ impl HostProxy {
             return Err(HostProxyError::new("no routes configured"));
         }
         self.apply_tailnet_identity();
+        self.apply_client_networks()?;
 
         let mut loaded_routes_by_hostname = HashMap::new();
         let mut reloadable_digests = Vec::new();
@@ -774,6 +812,25 @@ impl HostProxy {
     }
 }
 
+impl HostProxy {
+    fn apply_client_networks(&mut self) -> Result<(), HostProxyError> {
+        for (hostname, networks) in self.client_networks_by_hostname.drain() {
+            match self.routes_by_hostname.get_mut(&hostname) {
+                Some(Route::Proxy {
+                    allowed_client_networks,
+                    ..
+                }) => *allowed_client_networks = Some(networks),
+                Some(Route::Redirect { .. }) | None => {
+                    return Err(HostProxyError::new(format!(
+                        "client networks are set for {hostname}, which is not a proxied route"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Default for HostProxy {
     fn default() -> Self {
         HostProxy::new()
@@ -873,6 +930,42 @@ fn client_socket_address(session: &Session) -> Option<std::net::SocketAddr> {
     session.client_addr().and_then(SocketAddr::as_inet).copied()
 }
 
+fn admits_client(
+    hostname: &str,
+    access: Access,
+    allowed_client_networks: Option<&[ClientNetwork]>,
+    client_address: Option<IpAddr>,
+) -> bool {
+    let client_address_label = client_address
+        .map(|address| address.to_string())
+        .unwrap_or_default();
+    if access == Access::Private && !client_address.is_some_and(is_private_client) {
+        event!(
+            name: "proxy.route.forbidden",
+            Level::WARN,
+            server.address = hostname,
+            client.address = client_address_label,
+            "denied public access to private route {{server.address}} from {{client.address}}",
+        );
+        return false;
+    }
+    let outside_allowed_networks = allowed_client_networks.is_some_and(|networks| {
+        !client_address
+            .is_some_and(|address| networks.iter().any(|network| network.contains(address)))
+    });
+    if outside_allowed_networks {
+        event!(
+            name: "proxy.route.client_network_forbidden",
+            Level::WARN,
+            server.address = hostname,
+            client.address = client_address_label,
+            "denied {{client.address}} outside the allowed networks of {{server.address}}",
+        );
+        return false;
+    }
+    true
+}
+
 fn client_ip_address(session: &Session) -> Option<IpAddr> {
     client_socket_address(session).map(|socket_address| socket_address.ip())
 }
@@ -955,8 +1048,13 @@ impl ProxyHttp for HostRouter {
 
         context.routed_hostname = Some(hostname.clone());
 
-        let (upstream_address, access, bearer_token_digests, identifies_tailnet_users) = match route
-        {
+        let (
+            upstream_address,
+            access,
+            bearer_token_digests,
+            identifies_tailnet_users,
+            allowed_client_networks,
+        ) = match route {
             LoadedRoute::Redirect { target_host } => {
                 let redirect_location =
                     format!("https://{target_host}{}", requested_path_and_query(session));
@@ -968,31 +1066,24 @@ impl ProxyHttp for HostRouter {
                 access,
                 bearer_token_digests,
                 identifies_tailnet_users,
+                allowed_client_networks,
             } => (
                 upstream_address,
                 *access,
                 bearer_token_digests.as_ref(),
                 *identifies_tailnet_users,
+                allowed_client_networks.as_deref(),
             ),
         };
 
-        if access == Access::Private {
-            let client_address = client_ip_address(session);
-            let is_allowed = client_address.is_some_and(is_private_client);
-
-            if !is_allowed {
-                event!(
-                    name: "proxy.route.forbidden",
-                    Level::WARN,
-                    server.address = hostname,
-                    client.address = client_address
-                        .map(|address| address.to_string())
-                        .unwrap_or_default(),
-                    "denied public access to private route {{server.address}} from {{client.address}}",
-                );
-                session.respond_error(403).await?;
-                return Ok(true);
-            }
+        if !admits_client(
+            &hostname,
+            access,
+            allowed_client_networks,
+            client_ip_address(session),
+        ) {
+            session.respond_error(403).await?;
+            return Ok(true);
         }
 
         if let Some(accepted_digests) = bearer_token_digests {
@@ -1145,12 +1236,83 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     use super::{
-        constant_time_equals, is_private_client, parse_hexadecimal_digest, sha256, Access,
-        BearerTokenDigests, HostProxy, Route,
+        admits_client, constant_time_equals, is_private_client, parse_hexadecimal_digest, sha256,
+        Access, BearerTokenDigests, ClientNetwork, HostProxy, Route,
     };
 
     fn parsed(address: &str) -> IpAddr {
         address.parse().expect("invalid test address")
+    }
+
+    fn anthropic_networks() -> Vec<ClientNetwork> {
+        ["160.79.104.0/21", "153.61.208.0/20"]
+            .iter()
+            .map(|network| network.parse().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_route_with_networks_admits_only_clients_inside_them() {
+        let networks = anthropic_networks();
+
+        assert!(admits_client(
+            "mcp.example.org",
+            Access::Public,
+            Some(&networks),
+            Some(parsed("160.79.105.20"))
+        ));
+        assert!(!admits_client(
+            "mcp.example.org",
+            Access::Public,
+            Some(&networks),
+            Some(parsed("203.0.113.7"))
+        ));
+        assert!(!admits_client(
+            "mcp.example.org",
+            Access::Public,
+            Some(&networks),
+            None
+        ));
+    }
+
+    #[test]
+    fn a_route_without_networks_keeps_its_access_rule() {
+        assert!(admits_client(
+            "app.example.org",
+            Access::Public,
+            None,
+            Some(parsed("203.0.113.7"))
+        ));
+        assert!(!admits_client(
+            "admin.example.org",
+            Access::Private,
+            None,
+            Some(parsed("203.0.113.7"))
+        ));
+        assert!(admits_client(
+            "admin.example.org",
+            Access::Private,
+            None,
+            Some(parsed("100.64.0.17"))
+        ));
+    }
+
+    #[test]
+    fn private_access_and_networks_must_both_pass() {
+        let tailnet_only: Vec<ClientNetwork> = vec!["100.64.0.17/32".parse().unwrap()];
+
+        assert!(admits_client(
+            "admin.example.org",
+            Access::Private,
+            Some(&tailnet_only),
+            Some(parsed("100.64.0.17"))
+        ));
+        assert!(!admits_client(
+            "admin.example.org",
+            Access::Private,
+            Some(&tailnet_only),
+            Some(parsed("100.64.0.22"))
+        ));
     }
 
     #[test]

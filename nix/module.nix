@@ -26,8 +26,13 @@ let
             else
               "";
           tailnetIdentityTag = if route.identifyTailnetUsers then "!tailnet-identity" else "";
+          clientNetworksTag =
+            if route.allowedClientNetworks != null then
+              "!networks=${lib.concatStringsSep "+" route.allowedClientNetworks}"
+            else
+              "";
         in
-        "${hostname}=${route.upstreamAddress}${accessTag}${bearerTag}${tailnetIdentityTag}"
+        "${hostname}=${route.upstreamAddress}${accessTag}${bearerTag}${tailnetIdentityTag}${clientNetworksTag}"
     ) hostProxyConfiguration.routes
   );
   identifiesTailnetUsers = lib.any (route: route.identifyTailnetUsers) (
@@ -114,6 +119,18 @@ in
                 the upstream can trust them. Off by default, so a host that never
                 sets it never contacts tailscaled. Pair it with access = "private"
                 so only tailnet clients reach the route at all.
+              '';
+            };
+            allowedClientNetworks = lib.mkOption {
+              type = lib.types.nullOr (lib.types.nonEmptyListOf lib.types.str);
+              default = null;
+              example = [ "192.0.2.0/24" "2001:db8::/32" ];
+              description = ''
+                Networks, in address/prefix form, that may reach this route.
+                Every other client gets a 403 before authentication or
+                proxying. Null accepts any client the access setting allows.
+                Suits a public route only a known service should call, such as
+                a provider's published outbound ranges.
               '';
             };
           };

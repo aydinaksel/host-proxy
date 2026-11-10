@@ -2,7 +2,7 @@ use std::convert::Infallible;
 use std::env;
 use std::process::ExitCode;
 
-use host_proxy::{Access, Certificate, HostProxy, HostProxyError};
+use host_proxy::{Access, Certificate, ClientNetwork, HostProxy, HostProxyError};
 use tracing::{event, Level};
 
 const ROUTES_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_ROUTES";
@@ -13,6 +13,7 @@ const TAILSCALED_SOCKET_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_TAILSCALED_SOCK
 const HTTPS_ADDRESSES_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_HTTPS_ADDRESSES";
 const HTTP_ADDRESSES_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_HTTP_ADDRESSES";
 const TAILNET_IDENTITY_TAG: &str = "tailnet-identity";
+const CLIENT_NETWORKS_TAG_PREFIX: &str = "networks=";
 
 fn required_environment_variable(name: &str) -> Result<String, HostProxyError> {
     env::var(name).map_err(|error| {
@@ -33,6 +34,83 @@ fn address_list(name: &str) -> Option<Vec<String>> {
             .map(str::to_string)
             .collect()
     })
+}
+
+fn parse_client_networks(networks: &str) -> Result<Vec<ClientNetwork>, HostProxyError> {
+    let parsed: Vec<ClientNetwork> = networks
+        .split('+')
+        .map(|network| {
+            network
+                .parse()
+                .map_err(|error| HostProxyError::new(format!("{error}")))
+        })
+        .collect::<Result<_, _>>()?;
+    if parsed.is_empty() {
+        return Err(HostProxyError::new("the networks tag lists no networks"));
+    }
+    Ok(parsed)
+}
+
+fn add_route_entry(proxy: HostProxy, route_entry: &str) -> Result<HostProxy, HostProxyError> {
+    let Some((hostname, target)) = route_entry.split_once('=') else {
+        return Err(HostProxyError::new(format!(
+            "invalid route entry {route_entry:?} in {ROUTES_ENVIRONMENT_VARIABLE}, \
+             expected hostname=address, hostname=address!private, \
+             hostname=address!bearer-sha256=/path/to/digests, hostname=address!tailnet-identity, \
+             hostname=address!networks=192.0.2.0/24+198.51.100.0/24, or hostname=>redirecthost"
+        )));
+    };
+
+    let proxy = if let Some(redirect_host) = target.strip_prefix('>') {
+        proxy.redirect(hostname.trim(), redirect_host.trim())
+    } else {
+        let mut tags = target.split('!');
+        let upstream_address = tags.next().unwrap_or(target).trim();
+
+        let mut access = Access::Public;
+        let mut token_digest_file_path = None;
+        let mut identifies_tailnet_users = false;
+        let mut allowed_client_networks = None;
+
+        for tag in tags {
+            let tag = tag.trim();
+            if let Some(path) = tag.strip_prefix("bearer-sha256=") {
+                token_digest_file_path = Some(path.trim().to_string());
+            } else if tag == TAILNET_IDENTITY_TAG {
+                identifies_tailnet_users = true;
+            } else if let Some(networks) = tag.strip_prefix(CLIENT_NETWORKS_TAG_PREFIX) {
+                allowed_client_networks = Some(parse_client_networks(networks)?);
+            } else {
+                access = match tag {
+                    "private" => Access::Private,
+                    "public" => Access::Public,
+                    other => {
+                        return Err(HostProxyError::new(format!(
+                            "unknown route tag {other:?}, expected 'private', 'public', \
+                             'tailnet-identity', 'networks=...', or 'bearer-sha256=/path/to/digests'"
+                        )));
+                    }
+                };
+            }
+        }
+
+        let routed = match token_digest_file_path {
+            Some(path) => {
+                proxy.authenticated_route(hostname.trim(), upstream_address, access, path)
+            }
+            None => proxy.route(hostname.trim(), upstream_address, access),
+        };
+        let identified = if identifies_tailnet_users {
+            routed.identify_tailnet_users(hostname.trim())
+        } else {
+            routed
+        };
+        match allowed_client_networks {
+            Some(networks) => identified.allow_clients_from(hostname.trim(), networks),
+            None => identified,
+        }
+    };
+    Ok(proxy)
 }
 
 fn main() -> ExitCode {
@@ -90,56 +168,7 @@ fn configure_and_run() -> Result<Infallible, HostProxyError> {
         .split(',')
         .filter(|route_entry| !route_entry.is_empty())
     {
-        let Some((hostname, target)) = route_entry.split_once('=') else {
-            return Err(HostProxyError::new(format!(
-                "invalid route entry {route_entry:?} in {ROUTES_ENVIRONMENT_VARIABLE}, \
-                 expected hostname=address, hostname=address!private, \
-                 hostname=address!bearer-sha256=/path/to/digests, hostname=address!tailnet-identity, or hostname=>redirecthost"
-            )));
-        };
-
-        proxy = if let Some(redirect_host) = target.strip_prefix('>') {
-            proxy.redirect(hostname.trim(), redirect_host.trim())
-        } else {
-            let mut tags = target.split('!');
-            let upstream_address = tags.next().unwrap_or(target).trim();
-
-            let mut access = Access::Public;
-            let mut token_digest_file_path = None;
-            let mut identifies_tailnet_users = false;
-
-            for tag in tags {
-                let tag = tag.trim();
-                if let Some(path) = tag.strip_prefix("bearer-sha256=") {
-                    token_digest_file_path = Some(path.trim().to_string());
-                } else if tag == TAILNET_IDENTITY_TAG {
-                    identifies_tailnet_users = true;
-                } else {
-                    access = match tag {
-                        "private" => Access::Private,
-                        "public" => Access::Public,
-                        other => {
-                            return Err(HostProxyError::new(format!(
-                                "unknown route tag {other:?}, expected 'private', 'public', \
-                                 'tailnet-identity', or 'bearer-sha256=/path/to/digests'"
-                            )));
-                        }
-                    };
-                }
-            }
-
-            let routed = match token_digest_file_path {
-                Some(path) => {
-                    proxy.authenticated_route(hostname.trim(), upstream_address, access, path)
-                }
-                None => proxy.route(hostname.trim(), upstream_address, access),
-            };
-            if identifies_tailnet_users {
-                routed.identify_tailnet_users(hostname.trim())
-            } else {
-                routed
-            }
-        };
+        proxy = add_route_entry(proxy, route_entry)?;
     }
 
     for certificate_entry in certificates_specification

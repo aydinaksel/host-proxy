@@ -44,6 +44,13 @@ the headers rather than refused. Every route strips those headers from client
 requests, whether or not it identifies anyone, so an upstream can trust them.
 A host with no identifying route never contacts tailscaled. Pair it with a
 private route so only tailnet clients reach the upstream at all.
+
+Any proxied route can also **accept only listed networks**: clients outside
+them get a 403 before authentication or proxying, and are logged. It suits a
+public route that only a known service should call, such as a provider's
+published outbound ranges. It composes with the other rules, so a private route
+with networks requires both.
+
 - **Redirect**, which answers `301` with `Location: https://<target><path>`.
   TLS still terminates here, so a certificate covering the redirected
   hostname is required. The target is fixed configuration and is never taken
@@ -59,6 +66,8 @@ The `host-proxy` binary reads these environment variables:
   - `hostname=host:port!bearer-sha256=/path/to/digests` — authenticated proxy.
   - `hostname=host:port!tailnet-identity` — proxy that identifies tailnet
     users.
+  - `hostname=host:port!networks=192.0.2.0/24+2001:db8::/32` — proxy that
+    accepts only clients inside the `+`-separated networks.
   - `hostname=>targethost` — permanent redirect to `https://targethost`.
 
   Tags combine, so `hostname=host:port!private!bearer-sha256=/path/to/digests`
@@ -104,6 +113,10 @@ services.hostProxy = {
       upstreamAddress = "127.0.0.1:6000";
       access = "private";
       identifyTailnetUsers = true;
+    };
+    "connector.example.org" = {
+      upstreamAddress = "127.0.0.1:7000";
+      allowedClientNetworks = [ "192.0.2.0/24" "2001:db8::/32" ];
     };
     "www.example.org" = { redirectTo = "example.org"; };
   };
