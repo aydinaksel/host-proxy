@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use http::uri::PathAndQuery;
+pub use http::HeaderName;
 use openssl::sha::sha256;
 use pingora::http::ResponseHeader;
 use pingora::listeners::tls::TlsSettings;
@@ -110,16 +111,53 @@ const SHA256_HEXADECIMAL_LENGTH: usize = 64;
 
 type TokenDigest = [u8; SHA256_DIGEST_LENGTH_BYTES];
 
+const MAXIMUM_TOKEN_IDENTITY_LENGTH: usize = 150;
+
+/// Name a bearer token stands for, such as `fbrmarble.pan`.
+///
+/// It is made of ASCII letters, digits, `.`, `_` and `-`, at most 150
+/// characters, so it is safe to pass upstream in a header and fits the tenant
+/// identifiers Loki and Mimir accept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenIdentity(Arc<str>);
+
+impl TokenIdentity {
+    fn parse(text: &str) -> Option<Self> {
+        let is_identity_character =
+            |character: char| character.is_ascii_alphanumeric() || "._-".contains(character);
+        let is_valid = !text.is_empty()
+            && text.len() <= MAXIMUM_TOKEN_IDENTITY_LENGTH
+            && text.chars().all(is_identity_character);
+        is_valid.then(|| TokenIdentity(Arc::from(text)))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AcceptedToken {
+    digest: TokenDigest,
+    identity: Option<TokenIdentity>,
+}
+
 /// SHA-256 digests of the bearer tokens accepted on a route. Only digests are
 /// configured, so the accepted set reveals no token and can live in public
 /// configuration. Holding several lets a token be rotated by adding the new
 /// digest, redeploying every client, and only then removing the old one. The
 /// set is reloaded from its file on SIGHUP, so rotation needs no restart and no
 /// dropped connections.
+///
+/// Each line of the file holds one digest, optionally followed by whitespace
+/// and the [`TokenIdentity`] that token stands for. A route that passes the
+/// identity upstream requires one on every line.
 #[derive(Clone)]
 pub struct BearerTokenDigests {
     digest_file_path: Arc<str>,
-    digests: Arc<RwLock<Vec<TokenDigest>>>,
+    requires_identities: bool,
+    accepted_tokens: Arc<RwLock<Vec<AcceptedToken>>>,
 }
 
 fn parse_hexadecimal_digest(line: &str) -> Option<TokenDigest> {
@@ -141,50 +179,87 @@ fn parse_hexadecimal_digest(line: &str) -> Option<TokenDigest> {
     bytes.and_then(|bytes| TokenDigest::try_from(bytes.as_slice()).ok())
 }
 
-fn read_digests(digest_file_path: &str) -> Result<Vec<TokenDigest>, String> {
+fn parse_accepted_token(line: &str) -> Option<AcceptedToken> {
+    let mut fields = line.split_whitespace();
+    let digest = parse_hexadecimal_digest(fields.next()?)?;
+    let identity = match fields.next() {
+        Some(identity) => Some(TokenIdentity::parse(identity)?),
+        None => None,
+    };
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(AcceptedToken { digest, identity })
+}
+
+fn read_accepted_tokens(
+    digest_file_path: &str,
+    requires_identities: bool,
+) -> Result<Vec<AcceptedToken>, String> {
     let contents = fs::read_to_string(digest_file_path)
         .map_err(|error| format!("failed to read {digest_file_path}: {error}"))?;
 
-    let digests: Option<Vec<TokenDigest>> = contents
+    let accepted_tokens: Option<Vec<AcceptedToken>> = contents
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .map(parse_hexadecimal_digest)
+        .map(parse_accepted_token)
         .collect();
 
-    let Some(digests) = digests else {
+    let Some(accepted_tokens) = accepted_tokens else {
         return Err(format!(
             "bearer token digest file {digest_file_path} has a line that is not a \
-             {SHA256_HEXADECIMAL_LENGTH}-character hexadecimal SHA-256 digest"
+             {SHA256_HEXADECIMAL_LENGTH}-character hexadecimal SHA-256 digest, optionally \
+             followed by an identity of letters, digits, '.', '_' and '-'"
         ));
     };
 
-    if digests.is_empty() {
+    if accepted_tokens.is_empty() {
         return Err(format!(
             "bearer token digest file {digest_file_path} contains no digests"
         ));
     }
 
-    Ok(digests)
+    let lacks_an_identity = accepted_tokens
+        .iter()
+        .any(|accepted_token| accepted_token.identity.is_none());
+    if requires_identities && lacks_an_identity {
+        return Err(format!(
+            "bearer token digest file {digest_file_path} has a digest without an identity, \
+             which a route passing identities upstream cannot accept"
+        ));
+    }
+
+    Ok(accepted_tokens)
+}
+
+/// A presented bearer token that matched one of the accepted digests.
+pub struct AuthenticatedToken {
+    pub identity: Option<TokenIdentity>,
 }
 
 impl BearerTokenDigests {
-    fn load(digest_file_path: &str) -> Result<Self, HostProxyError> {
-        let digests = read_digests(digest_file_path).map_err(|error| {
-            HostProxyError::new(format!("failed to load bearer token digests: {error}"))
-        })?;
+    fn load(digest_file_path: &str, requires_identities: bool) -> Result<Self, HostProxyError> {
+        let accepted_tokens =
+            read_accepted_tokens(digest_file_path, requires_identities).map_err(|error| {
+                HostProxyError::new(format!("failed to load bearer token digests: {error}"))
+            })?;
 
         Ok(BearerTokenDigests {
             digest_file_path: Arc::from(digest_file_path),
-            digests: Arc::new(RwLock::new(digests)),
+            requires_identities,
+            accepted_tokens: Arc::new(RwLock::new(accepted_tokens)),
         })
     }
 
     fn reload(&self) {
-        match read_digests(&self.digest_file_path) {
-            Ok(reloaded_digests) => {
-                let digest_count = reloaded_digests.len();
-                *self.digests.write().unwrap_or_else(PoisonError::into_inner) = reloaded_digests;
+        match read_accepted_tokens(&self.digest_file_path, self.requires_identities) {
+            Ok(reloaded_tokens) => {
+                let digest_count = reloaded_tokens.len();
+                *self
+                    .accepted_tokens
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner) = reloaded_tokens;
                 event!(
                     name: "proxy.tokens.reloaded",
                     Level::INFO,
@@ -205,16 +280,22 @@ impl BearerTokenDigests {
         }
     }
 
-    #[expect(
-        clippy::unnecessary_fold,
-        reason = "any short-circuits on the first match, which would leak through timing \
-                  which of the accepted tokens was presented"
-    )]
-    fn accepts(&self, presented_token: &str) -> bool {
+    fn authenticate(&self, presented_token: &str) -> Option<AuthenticatedToken> {
         let presented_digest = sha256(presented_token.as_bytes());
-        let digests = self.digests.read().unwrap_or_else(PoisonError::into_inner);
-        digests.iter().fold(false, |accepted, digest| {
-            constant_time_equals(digest, &presented_digest) || accepted
+        let accepted_tokens = self
+            .accepted_tokens
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Every digest is compared even after a match, so the response time
+        // does not reveal which of the accepted tokens was presented.
+        let matched_token = accepted_tokens
+            .iter()
+            .fold(None, |matched, accepted_token| {
+                let is_match = constant_time_equals(&accepted_token.digest, &presented_digest);
+                matched.or(is_match.then_some(accepted_token))
+            });
+        matched_token.map(|accepted_token| AuthenticatedToken {
+            identity: accepted_token.identity.clone(),
         })
     }
 }
@@ -445,6 +526,8 @@ enum Route {
         bearer_token_digest_file_path: Option<String>,
         identifies_tailnet_users: bool,
         allowed_client_networks: Option<Vec<ClientNetwork>>,
+        allowed_paths: Option<Vec<String>>,
+        identity_header: Option<HeaderName>,
     },
     Redirect {
         target_host: String,
@@ -458,6 +541,8 @@ enum LoadedRoute {
         bearer_token_digests: Option<BearerTokenDigests>,
         identifies_tailnet_users: bool,
         allowed_client_networks: Option<Vec<ClientNetwork>>,
+        allowed_paths: Option<Vec<String>>,
+        identity_header: Option<HeaderName>,
     },
     Redirect {
         target_host: String,
@@ -473,6 +558,8 @@ impl Route {
                 bearer_token_digest_file_path,
                 identifies_tailnet_users,
                 allowed_client_networks,
+                allowed_paths,
+                identity_header,
             } => {
                 let client_networks_label = allowed_client_networks.as_ref().map_or_else(
                     || "any".to_string(),
@@ -484,6 +571,11 @@ impl Route {
                             .join(" ")
                     },
                 );
+                let allowed_paths_label = allowed_paths
+                    .as_ref()
+                    .map_or_else(|| "any".to_string(), |paths| paths.join(" "));
+                let identity_header_label =
+                    identity_header.as_ref().map_or("none", HeaderName::as_str);
                 let access_label = match access {
                     Access::Public => "public",
                     Access::Private => "private",
@@ -497,7 +589,9 @@ impl Route {
                     route.authenticated = bearer_token_digest_file_path.is_some(),
                     route.tailnet_identity = identifies_tailnet_users,
                     route.client_networks = client_networks_label,
-                    "routing {{server.address}} to {{upstream.address}} ({{route.access}}, authenticated={{route.authenticated}}, tailnet_identity={{route.tailnet_identity}}, client_networks={{route.client_networks}})",
+                    route.allowed_paths = allowed_paths_label,
+                    route.identity_header = identity_header_label,
+                    "routing {{server.address}} to {{upstream.address}} ({{route.access}}, authenticated={{route.authenticated}}, tailnet_identity={{route.tailnet_identity}}, client_networks={{route.client_networks}}, allowed_paths={{route.allowed_paths}}, identity_header={{route.identity_header}})",
                 );
             }
             Route::Redirect { target_host } => {
@@ -520,9 +614,14 @@ impl Route {
                 bearer_token_digest_file_path,
                 identifies_tailnet_users,
                 allowed_client_networks,
+                allowed_paths,
+                identity_header,
             } => {
+                let requires_identities = identity_header.is_some();
                 let bearer_token_digests = bearer_token_digest_file_path
-                    .map(|digest_file_path| BearerTokenDigests::load(&digest_file_path))
+                    .map(|digest_file_path| {
+                        BearerTokenDigests::load(&digest_file_path, requires_identities)
+                    })
                     .transpose()?;
                 Ok(LoadedRoute::Proxy {
                     upstream_address,
@@ -530,6 +629,8 @@ impl Route {
                     bearer_token_digests,
                     identifies_tailnet_users,
                     allowed_client_networks,
+                    allowed_paths,
+                    identity_header,
                 })
             }
             Route::Redirect { target_host } => Ok(LoadedRoute::Redirect { target_host }),
@@ -544,6 +645,8 @@ pub struct HostProxy {
     metrics_address: Option<String>,
     tailnet_identity_hostnames: HashSet<String>,
     client_networks_by_hostname: HashMap<String, Vec<ClientNetwork>>,
+    allowed_paths_by_hostname: HashMap<String, Vec<String>>,
+    identity_headers_by_hostname: HashMap<String, HeaderName>,
     tailscaled_socket_path: String,
     https_addresses: Vec<String>,
     http_addresses: Vec<String>,
@@ -559,6 +662,8 @@ impl HostProxy {
             metrics_address: None,
             tailnet_identity_hostnames: HashSet::new(),
             client_networks_by_hostname: HashMap::new(),
+            allowed_paths_by_hostname: HashMap::new(),
+            identity_headers_by_hostname: HashMap::new(),
             tailscaled_socket_path: DEFAULT_TAILSCALED_SOCKET_PATH.to_string(),
             https_addresses: DEFAULT_HTTPS_ADDRESSES.map(str::to_string).to_vec(),
             http_addresses: DEFAULT_HTTP_ADDRESSES.map(str::to_string).to_vec(),
@@ -597,6 +702,8 @@ impl HostProxy {
                 bearer_token_digest_file_path: None,
                 identifies_tailnet_users: false,
                 allowed_client_networks: None,
+                allowed_paths: None,
+                identity_header: None,
             },
         );
         self
@@ -625,6 +732,8 @@ impl HostProxy {
                 bearer_token_digest_file_path: Some(token_digest_file_path.into()),
                 identifies_tailnet_users: false,
                 allowed_client_networks: None,
+                allowed_paths: None,
+                identity_header: None,
             },
         );
         self
@@ -667,6 +776,34 @@ impl HostProxy {
         self
     }
 
+    /// Accept requests for `hostname` only when their path is exactly one of
+    /// `paths`, answering 403 to every other path before authentication or
+    /// proxying.
+    ///
+    /// The query string is not part of the comparison. Paths are compared as
+    /// sent, so an encoded or dot-segment variant of an allowed path is
+    /// refused rather than normalised. This suits an ingest route whose token
+    /// should reach only the write endpoints of a store that also serves reads.
+    #[must_use]
+    pub fn allow_paths(mut self, hostname: impl Into<String>, paths: Vec<String>) -> Self {
+        self.allowed_paths_by_hostname
+            .insert(hostname.into().to_ascii_lowercase(), paths);
+        self
+    }
+
+    /// Pass the identity of the presented bearer token upstream in `header`.
+    ///
+    /// The route must be an [`HostProxy::authenticated_route`], and every
+    /// line of its digest file must name a [`TokenIdentity`]. Any value the
+    /// client sent in `header` is removed, so the upstream can trust it, for
+    /// example as the `X-Scope-OrgID` tenant of Loki or Mimir.
+    #[must_use]
+    pub fn pass_token_identity(mut self, hostname: impl Into<String>, header: HeaderName) -> Self {
+        self.identity_headers_by_hostname
+            .insert(hostname.into().to_ascii_lowercase(), header);
+        self
+    }
+
     #[must_use]
     pub fn https_addresses(mut self, addresses: Vec<String>) -> Self {
         self.https_addresses = addresses;
@@ -697,6 +834,8 @@ impl HostProxy {
         }
         self.apply_tailnet_identity();
         self.apply_client_networks()?;
+        self.apply_allowed_paths()?;
+        self.apply_identity_headers()?;
 
         let mut loaded_routes_by_hostname = HashMap::new();
         let mut reloadable_digests = Vec::new();
@@ -829,6 +968,48 @@ impl HostProxy {
         }
         Ok(())
     }
+
+    fn apply_allowed_paths(&mut self) -> Result<(), HostProxyError> {
+        for (hostname, paths) in self.allowed_paths_by_hostname.drain() {
+            if paths.is_empty() {
+                return Err(HostProxyError::new(format!(
+                    "allowed paths for {hostname} list no paths"
+                )));
+            }
+            if let Some(relative_path) = paths.iter().find(|path| !path.starts_with('/')) {
+                return Err(HostProxyError::new(format!(
+                    "allowed path {relative_path:?} for {hostname} does not start with '/'"
+                )));
+            }
+            let Some(Route::Proxy { allowed_paths, .. }) =
+                self.routes_by_hostname.get_mut(&hostname)
+            else {
+                return Err(HostProxyError::new(format!(
+                    "allowed paths are set for {hostname}, which is not a proxied route"
+                )));
+            };
+            *allowed_paths = Some(paths);
+        }
+        Ok(())
+    }
+
+    fn apply_identity_headers(&mut self) -> Result<(), HostProxyError> {
+        for (hostname, header) in self.identity_headers_by_hostname.drain() {
+            let Some(Route::Proxy {
+                bearer_token_digest_file_path: Some(_),
+                identity_header,
+                ..
+            }) = self.routes_by_hostname.get_mut(&hostname)
+            else {
+                return Err(HostProxyError::new(format!(
+                    "an identity header is set for {hostname}, which is not an authenticated \
+                     proxied route"
+                )));
+            };
+            *identity_header = Some(header);
+        }
+        Ok(())
+    }
 }
 
 impl Default for HostProxy {
@@ -880,6 +1061,8 @@ pub struct RequestContext {
     routed_hostname: Option<String>,
     upstream_address: Option<String>,
     tailnet_identity: Option<TailnetIdentity>,
+    identity_header: Option<HeaderName>,
+    token_identity: Option<TokenIdentity>,
 }
 
 struct RedirectToHttps;
@@ -966,6 +1149,21 @@ fn admits_client(
     true
 }
 
+fn admits_path(hostname: &str, allowed_paths: Option<&[String]>, requested_path: &str) -> bool {
+    let is_allowed =
+        allowed_paths.is_none_or(|paths| paths.iter().any(|path| path == requested_path));
+    if !is_allowed {
+        event!(
+            name: "proxy.route.path_forbidden",
+            Level::WARN,
+            server.address = hostname,
+            url.path = requested_path,
+            "denied {{server.address}}{{url.path}}, which is not an allowed path",
+        );
+    }
+    is_allowed
+}
+
 fn client_ip_address(session: &Session) -> Option<IpAddr> {
     client_socket_address(session).map(|socket_address| socket_address.ip())
 }
@@ -983,6 +1181,28 @@ fn insert_identity_header(upstream_request: &mut RequestHeader, name: &'static s
             "left out the {{http.header.name}} header: {{error.message}}",
         );
     }
+}
+
+fn presented_bearer_token(session: &Session) -> Option<&str> {
+    session
+        .req_header()
+        .headers
+        .get("authorization")
+        .and_then(|header_value| header_value.to_str().ok())
+        .and_then(|header_value| header_value.strip_prefix("Bearer "))
+        .map(str::trim)
+}
+
+fn pass_token_identity(
+    upstream_request: &mut RequestHeader,
+    identity_header: &HeaderName,
+    token_identity: Option<&TokenIdentity>,
+) -> Result<()> {
+    upstream_request.remove_header(identity_header);
+    let Some(token_identity) = token_identity else {
+        return Ok(());
+    };
+    upstream_request.insert_header(identity_header, token_identity.as_str())
 }
 
 fn requested_hostname(session: &Session) -> Option<String> {
@@ -1054,6 +1274,8 @@ impl ProxyHttp for HostRouter {
             bearer_token_digests,
             identifies_tailnet_users,
             allowed_client_networks,
+            allowed_paths,
+            identity_header,
         ) = match route {
             LoadedRoute::Redirect { target_host } => {
                 let redirect_location =
@@ -1067,37 +1289,36 @@ impl ProxyHttp for HostRouter {
                 bearer_token_digests,
                 identifies_tailnet_users,
                 allowed_client_networks,
+                allowed_paths,
+                identity_header,
             } => (
                 upstream_address,
                 *access,
                 bearer_token_digests.as_ref(),
                 *identifies_tailnet_users,
                 allowed_client_networks.as_deref(),
+                allowed_paths.as_deref(),
+                identity_header.as_ref(),
             ),
         };
 
-        if !admits_client(
-            &hostname,
-            access,
-            allowed_client_networks,
-            client_ip_address(session),
-        ) {
+        let is_admitted =
+            admits_client(
+                &hostname,
+                access,
+                allowed_client_networks,
+                client_ip_address(session),
+            ) && admits_path(&hostname, allowed_paths, session.req_header().uri.path());
+        if !is_admitted {
             session.respond_error(403).await?;
             return Ok(true);
         }
 
         if let Some(accepted_digests) = bearer_token_digests {
-            let presented_token = session
-                .req_header()
-                .headers
-                .get("authorization")
-                .and_then(|header_value| header_value.to_str().ok())
-                .and_then(|header_value| header_value.strip_prefix("Bearer "));
+            let authenticated_token = presented_bearer_token(session)
+                .and_then(|token| accepted_digests.authenticate(token));
 
-            let is_authenticated =
-                presented_token.is_some_and(|token| accepted_digests.accepts(token.trim()));
-
-            if !is_authenticated {
+            let Some(authenticated_token) = authenticated_token else {
                 event!(
                     name: "proxy.route.unauthenticated",
                     Level::WARN,
@@ -1107,8 +1328,10 @@ impl ProxyHttp for HostRouter {
                 );
                 write_unauthorized(session).await?;
                 return Ok(true);
-            }
+            };
+            context.token_identity = authenticated_token.identity;
         }
+        context.identity_header = identity_header.cloned();
 
         if identifies_tailnet_users {
             if let Some(client) = client_socket_address(session) {
@@ -1163,6 +1386,13 @@ impl ProxyHttp for HostRouter {
                 tailnet::USER_NAME_HEADER,
                 &identity.display_name,
             );
+        }
+        if let Some(identity_header) = &context.identity_header {
+            pass_token_identity(
+                upstream_request,
+                identity_header,
+                context.token_identity.as_ref(),
+            )?;
         }
         Ok(())
     }
@@ -1236,8 +1466,9 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     use super::{
-        admits_client, constant_time_equals, is_private_client, parse_hexadecimal_digest, sha256,
-        Access, BearerTokenDigests, ClientNetwork, HostProxy, Route,
+        admits_client, admits_path, constant_time_equals, is_private_client, parse_accepted_token,
+        parse_hexadecimal_digest, sha256, AcceptedToken, Access, BearerTokenDigests, ClientNetwork,
+        HeaderName, HostProxy, Route, TokenIdentity,
     };
 
     fn parsed(address: &str) -> IpAddr {
@@ -1356,13 +1587,21 @@ mod tests {
             .concat()
     }
 
+    fn accepts(accepted: &BearerTokenDigests, token: &str) -> bool {
+        accepted.authenticate(token).is_some()
+    }
+
     fn digests_of(tokens: &[&str]) -> BearerTokenDigests {
         BearerTokenDigests {
             digest_file_path: Arc::from("test-digests"),
-            digests: Arc::new(RwLock::new(
+            requires_identities: false,
+            accepted_tokens: Arc::new(RwLock::new(
                 tokens
                     .iter()
-                    .map(|token| sha256(token.as_bytes()))
+                    .map(|token| AcceptedToken {
+                        digest: sha256(token.as_bytes()),
+                        identity: None,
+                    })
                     .collect(),
             )),
         }
@@ -1380,23 +1619,23 @@ mod tests {
     #[test]
     fn accepts_any_token_whose_digest_is_configured() {
         let accepted = digests_of(&["first-token", "second-token"]);
-        assert!(accepted.accepts("first-token"));
-        assert!(accepted.accepts("second-token"));
+        assert!(accepts(&accepted, "first-token"));
+        assert!(accepts(&accepted, "second-token"));
     }
 
     #[test]
     fn rejects_unknown_and_partial_tokens() {
         let accepted = digests_of(&["first-token"]);
-        assert!(!accepted.accepts("wrong-token"));
-        assert!(!accepted.accepts("first"));
-        assert!(!accepted.accepts("first-token-extra"));
-        assert!(!accepted.accepts(""));
+        assert!(!accepts(&accepted, "wrong-token"));
+        assert!(!accepts(&accepted, "first"));
+        assert!(!accepts(&accepted, "first-token-extra"));
+        assert!(!accepts(&accepted, ""));
     }
 
     #[test]
     fn rejects_the_digest_presented_as_a_token() {
         let accepted = digests_of(&["first-token"]);
-        assert!(!accepted.accepts(&hexadecimal_digest("first-token")));
+        assert!(!accepts(&accepted, &hexadecimal_digest("first-token")));
     }
 
     #[test]
@@ -1436,7 +1675,7 @@ mod tests {
     #[test]
     fn load_rejects_a_file_holding_a_plain_token() {
         let path = temporary_digest_file("first-token\n", "load-plain-token");
-        assert!(BearerTokenDigests::load(path.to_str().unwrap()).is_err());
+        assert!(BearerTokenDigests::load(path.to_str().unwrap(), false).is_err());
 
         std::fs::remove_file(&path).unwrap();
     }
@@ -1444,14 +1683,14 @@ mod tests {
     #[test]
     fn reload_swaps_the_accepted_token_set() {
         let path = temporary_digest_file(&digest_file_contents(&["first-token"]), "reload-swap");
-        let accepted = BearerTokenDigests::load(path.to_str().unwrap()).unwrap();
-        assert!(accepted.accepts("first-token"));
+        let accepted = BearerTokenDigests::load(path.to_str().unwrap(), false).unwrap();
+        assert!(accepts(&accepted, "first-token"));
 
         std::fs::write(&path, digest_file_contents(&["second-token"])).unwrap();
         accepted.reload();
 
-        assert!(accepted.accepts("second-token"));
-        assert!(!accepted.accepts("first-token"));
+        assert!(accepts(&accepted, "second-token"));
+        assert!(!accepts(&accepted, "first-token"));
 
         std::fs::remove_file(&path).unwrap();
     }
@@ -1459,12 +1698,12 @@ mod tests {
     #[test]
     fn reload_keeps_existing_digests_when_the_new_file_is_empty() {
         let path = temporary_digest_file(&digest_file_contents(&["only-token"]), "reload-empty");
-        let accepted = BearerTokenDigests::load(path.to_str().unwrap()).unwrap();
+        let accepted = BearerTokenDigests::load(path.to_str().unwrap(), false).unwrap();
 
         std::fs::write(&path, "\n   \n").unwrap();
         accepted.reload();
 
-        assert!(accepted.accepts("only-token"));
+        assert!(accepts(&accepted, "only-token"));
 
         std::fs::remove_file(&path).unwrap();
     }
@@ -1473,13 +1712,13 @@ mod tests {
     fn reload_keeps_existing_digests_when_the_new_file_holds_a_plain_token() {
         let path =
             temporary_digest_file(&digest_file_contents(&["only-token"]), "reload-plain-token");
-        let accepted = BearerTokenDigests::load(path.to_str().unwrap()).unwrap();
+        let accepted = BearerTokenDigests::load(path.to_str().unwrap(), false).unwrap();
 
         std::fs::write(&path, "second-token\n").unwrap();
         accepted.reload();
 
-        assert!(accepted.accepts("only-token"));
-        assert!(!accepted.accepts("second-token"));
+        assert!(accepts(&accepted, "only-token"));
+        assert!(!accepts(&accepted, "second-token"));
 
         std::fs::remove_file(&path).unwrap();
     }
@@ -1524,5 +1763,165 @@ mod tests {
         ));
         assert!(!identifies_tailnet_users(&unknown, "app.example.org"));
         assert!(!unknown.routes_by_hostname.contains_key("typo.example.org"));
+    }
+    fn identified_digest_file_contents(tokens: &[(&str, &str)]) -> String {
+        tokens
+            .iter()
+            .map(|(token, identity)| format!("{} {identity}\n", hexadecimal_digest(token)))
+            .collect::<Vec<String>>()
+            .concat()
+    }
+
+    #[test]
+    fn a_digest_line_may_name_the_identity_of_its_token() {
+        let digest = hexadecimal_digest("first-token");
+
+        assert_eq!(
+            parse_accepted_token(&format!("{digest} fbrmarble.pan")),
+            Some(AcceptedToken {
+                digest: sha256(b"first-token"),
+                identity: TokenIdentity::parse("fbrmarble.pan"),
+            })
+        );
+        assert_eq!(
+            parse_accepted_token(&digest),
+            Some(AcceptedToken {
+                digest: sha256(b"first-token"),
+                identity: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_digest_line_with_an_unsafe_identity_or_extra_fields_is_rejected() {
+        let digest = hexadecimal_digest("first-token");
+
+        assert_eq!(parse_accepted_token(&format!("{digest} pan,atlas")), None);
+        assert_eq!(parse_accepted_token(&format!("{digest} pan atlas")), None);
+        assert_eq!(
+            parse_accepted_token(&format!("{digest} {}", "a".repeat(151))),
+            None
+        );
+    }
+
+    #[test]
+    fn authenticating_returns_the_identity_of_the_matching_token() {
+        let path = temporary_digest_file(
+            &identified_digest_file_contents(&[
+                ("pan-token", "fbrmarble.pan"),
+                ("atlas-token", "chichek.atlas"),
+            ]),
+            "identities",
+        );
+        let accepted = BearerTokenDigests::load(path.to_str().unwrap(), true).unwrap();
+
+        let identity_of = |token: &str| {
+            accepted
+                .authenticate(token)
+                .and_then(|authenticated| authenticated.identity)
+        };
+        assert_eq!(
+            identity_of("pan-token"),
+            TokenIdentity::parse("fbrmarble.pan")
+        );
+        assert_eq!(
+            identity_of("atlas-token"),
+            TokenIdentity::parse("chichek.atlas")
+        );
+        assert!(accepted.authenticate("unknown-token").is_none());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_route_passing_identities_refuses_a_digest_without_one() {
+        let mut contents = identified_digest_file_contents(&[("pan-token", "fbrmarble.pan")]);
+        contents.push_str(&digest_file_contents(&["anonymous-token"]));
+        let path = temporary_digest_file(&contents, "missing-identity");
+
+        assert!(BearerTokenDigests::load(path.to_str().unwrap(), true).is_err());
+        BearerTokenDigests::load(path.to_str().unwrap(), false).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_route_with_allowed_paths_admits_only_those_exact_paths() {
+        let allowed = vec!["/loki/api/v1/push".to_string(), "/api/v1/push".to_string()];
+
+        assert!(admits_path(
+            "logs.example.org",
+            Some(&allowed),
+            "/loki/api/v1/push"
+        ));
+        assert!(admits_path(
+            "logs.example.org",
+            Some(&allowed),
+            "/api/v1/push"
+        ));
+        assert!(!admits_path(
+            "logs.example.org",
+            Some(&allowed),
+            "/loki/api/v1/query"
+        ));
+        assert!(!admits_path(
+            "logs.example.org",
+            Some(&allowed),
+            "/loki/api/v1/push/"
+        ));
+        assert!(!admits_path(
+            "logs.example.org",
+            Some(&allowed),
+            "/loki/api/v1/push/../query_range"
+        ));
+        assert!(!admits_path(
+            "logs.example.org",
+            Some(&allowed),
+            "/loki/api/v1/%70ush"
+        ));
+        assert!(admits_path("logs.example.org", None, "/anything"));
+    }
+
+    #[test]
+    fn allowed_paths_must_be_absolute_and_on_a_proxied_route() {
+        let mut relative = HostProxy::new()
+            .route("logs.example.org", "127.0.0.1:3100", Access::Public)
+            .allow_paths("logs.example.org", vec!["loki/api/v1/push".to_string()]);
+        let mut redirecting = HostProxy::new()
+            .redirect("www.example.org", "example.org")
+            .allow_paths("www.example.org", vec!["/".to_string()]);
+        let mut empty = HostProxy::new()
+            .route("logs.example.org", "127.0.0.1:3100", Access::Public)
+            .allow_paths("logs.example.org", Vec::new());
+
+        assert!(relative.apply_allowed_paths().is_err());
+        assert!(redirecting.apply_allowed_paths().is_err());
+        assert!(empty.apply_allowed_paths().is_err());
+    }
+
+    #[test]
+    fn an_identity_header_needs_an_authenticated_route() {
+        let tenant_header = HeaderName::from_static("x-scope-orgid");
+        let mut unauthenticated = HostProxy::new()
+            .route("logs.example.org", "127.0.0.1:3100", Access::Public)
+            .pass_token_identity("logs.example.org", tenant_header.clone());
+        let mut authenticated = HostProxy::new()
+            .authenticated_route(
+                "logs.example.org",
+                "127.0.0.1:3100",
+                Access::Public,
+                "digests",
+            )
+            .pass_token_identity("Logs.Example.org", tenant_header.clone());
+
+        assert!(unauthenticated.apply_identity_headers().is_err());
+        authenticated.apply_identity_headers().unwrap();
+        assert!(matches!(
+            authenticated.routes_by_hostname.get("logs.example.org"),
+            Some(Route::Proxy {
+                identity_header: Some(header),
+                ..
+            }) if *header == tenant_header
+        ));
     }
 }

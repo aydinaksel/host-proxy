@@ -2,7 +2,7 @@ use std::convert::Infallible;
 use std::env;
 use std::process::ExitCode;
 
-use host_proxy::{Access, Certificate, ClientNetwork, HostProxy, HostProxyError};
+use host_proxy::{Access, Certificate, ClientNetwork, HeaderName, HostProxy, HostProxyError};
 use tracing::{event, Level};
 
 const ROUTES_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_ROUTES";
@@ -14,6 +14,9 @@ const HTTPS_ADDRESSES_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_HTTPS_ADDRESSES";
 const HTTP_ADDRESSES_ENVIRONMENT_VARIABLE: &str = "HOST_PROXY_HTTP_ADDRESSES";
 const TAILNET_IDENTITY_TAG: &str = "tailnet-identity";
 const CLIENT_NETWORKS_TAG_PREFIX: &str = "networks=";
+const ALLOWED_PATHS_TAG_PREFIX: &str = "paths=";
+const IDENTITY_HEADER_TAG_PREFIX: &str = "identity-header=";
+const LIST_SEPARATOR: char = '+';
 
 fn required_environment_variable(name: &str) -> Result<String, HostProxyError> {
     env::var(name).map_err(|error| {
@@ -38,7 +41,7 @@ fn address_list(name: &str) -> Option<Vec<String>> {
 
 fn parse_client_networks(networks: &str) -> Result<Vec<ClientNetwork>, HostProxyError> {
     let parsed: Vec<ClientNetwork> = networks
-        .split('+')
+        .split(LIST_SEPARATOR)
         .map(|network| {
             network
                 .parse()
@@ -51,13 +54,30 @@ fn parse_client_networks(networks: &str) -> Result<Vec<ClientNetwork>, HostProxy
     Ok(parsed)
 }
 
+fn parse_allowed_paths(paths: &str) -> Vec<String> {
+    paths
+        .split(LIST_SEPARATOR)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn parse_identity_header(header: &str) -> Result<HeaderName, HostProxyError> {
+    HeaderName::from_bytes(header.trim().as_bytes()).map_err(|error| {
+        HostProxyError::new(format!("invalid identity header {header:?}: {error}"))
+    })
+}
+
 fn add_route_entry(proxy: HostProxy, route_entry: &str) -> Result<HostProxy, HostProxyError> {
     let Some((hostname, target)) = route_entry.split_once('=') else {
         return Err(HostProxyError::new(format!(
             "invalid route entry {route_entry:?} in {ROUTES_ENVIRONMENT_VARIABLE}, \
              expected hostname=address, hostname=address!private, \
              hostname=address!bearer-sha256=/path/to/digests, hostname=address!tailnet-identity, \
-             hostname=address!networks=192.0.2.0/24+198.51.100.0/24, or hostname=>redirecthost"
+             hostname=address!networks=192.0.2.0/24+198.51.100.0/24, \
+             hostname=address!paths=/write+/push, hostname=address!identity-header=X-Scope-OrgID, \
+             or hostname=>redirecthost"
         )));
     };
 
@@ -71,6 +91,8 @@ fn add_route_entry(proxy: HostProxy, route_entry: &str) -> Result<HostProxy, Hos
         let mut token_digest_file_path = None;
         let mut identifies_tailnet_users = false;
         let mut allowed_client_networks = None;
+        let mut allowed_paths = None;
+        let mut identity_header = None;
 
         for tag in tags {
             let tag = tag.trim();
@@ -80,6 +102,10 @@ fn add_route_entry(proxy: HostProxy, route_entry: &str) -> Result<HostProxy, Hos
                 identifies_tailnet_users = true;
             } else if let Some(networks) = tag.strip_prefix(CLIENT_NETWORKS_TAG_PREFIX) {
                 allowed_client_networks = Some(parse_client_networks(networks)?);
+            } else if let Some(paths) = tag.strip_prefix(ALLOWED_PATHS_TAG_PREFIX) {
+                allowed_paths = Some(parse_allowed_paths(paths));
+            } else if let Some(header) = tag.strip_prefix(IDENTITY_HEADER_TAG_PREFIX) {
+                identity_header = Some(parse_identity_header(header)?);
             } else {
                 access = match tag {
                     "private" => Access::Private,
@@ -87,7 +113,8 @@ fn add_route_entry(proxy: HostProxy, route_entry: &str) -> Result<HostProxy, Hos
                     other => {
                         return Err(HostProxyError::new(format!(
                             "unknown route tag {other:?}, expected 'private', 'public', \
-                             'tailnet-identity', 'networks=...', or 'bearer-sha256=/path/to/digests'"
+                             'tailnet-identity', 'networks=...', 'paths=...', 'identity-header=...', \
+                             or 'bearer-sha256=/path/to/digests'"
                         )));
                     }
                 };
@@ -105,9 +132,17 @@ fn add_route_entry(proxy: HostProxy, route_entry: &str) -> Result<HostProxy, Hos
         } else {
             routed
         };
-        match allowed_client_networks {
+        let restricted_to_networks = match allowed_client_networks {
             Some(networks) => identified.allow_clients_from(hostname.trim(), networks),
             None => identified,
+        };
+        let restricted_to_paths = match allowed_paths {
+            Some(paths) => restricted_to_networks.allow_paths(hostname.trim(), paths),
+            None => restricted_to_networks,
+        };
+        match identity_header {
+            Some(header) => restricted_to_paths.pass_token_identity(hostname.trim(), header),
+            None => restricted_to_paths,
         }
     };
     Ok(proxy)

@@ -61,7 +61,7 @@
           commonArgs
           // {
             pname = "host-proxy-deps";
-            version = "0.7.0";
+            version = "0.9.0";
           }
         );
 
@@ -69,7 +69,7 @@
           commonArgs
           // {
             pname = "host-proxy";
-            version = "0.7.0";
+            version = "0.9.0";
             inherit cargoArtifacts;
           }
         );

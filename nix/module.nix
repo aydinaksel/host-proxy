@@ -16,15 +16,22 @@ let
       else
         let
           accessTag = if route.access == "private" then "!private" else "";
+          identifiedDigestLines = lib.concatLists (
+            lib.mapAttrsToList (identity: digests: map (digest: "${digest} ${identity}") digests) (
+              lib.optionalAttrs (route.bearerTokenDigestsByIdentity != null) route.bearerTokenDigestsByIdentity
+            )
+          );
+          digestLines =
+            lib.optionals (route.bearerTokenDigests != null) route.bearerTokenDigests ++ identifiedDigestLines;
           bearerTag =
-            if route.bearerTokenDigests != null then
-              "!bearer-sha256=${
-                pkgs.writeText "host-proxy-${hostname}-bearer-token-digests" (
-                  lib.concatLines route.bearerTokenDigests
-                )
-              }"
+            if digestLines != [ ] then
+              "!bearer-sha256=${pkgs.writeText "host-proxy-${hostname}-bearer-token-digests" (lib.concatLines digestLines)}"
             else
               "";
+          allowedPathsTag =
+            if route.allowedPaths != null then "!paths=${lib.concatStringsSep "+" route.allowedPaths}" else "";
+          identityHeaderTag =
+            if route.identityHeader != null then "!identity-header=${route.identityHeader}" else "";
           tailnetIdentityTag = if route.identifyTailnetUsers then "!tailnet-identity" else "";
           clientNetworksTag =
             if route.allowedClientNetworks != null then
@@ -32,9 +39,11 @@ let
             else
               "";
         in
-        "${hostname}=${route.upstreamAddress}${accessTag}${bearerTag}${tailnetIdentityTag}${clientNetworksTag}"
+        "${hostname}=${route.upstreamAddress}${accessTag}${bearerTag}${tailnetIdentityTag}${clientNetworksTag}${allowedPathsTag}${identityHeaderTag}"
     ) hostProxyConfiguration.routes
   );
+  tokenDigest = lib.types.strMatching "[0-9a-fA-F]{64}";
+  tokenIdentityPattern = "[A-Za-z0-9._-]{1,150}";
   identifiesTailnetUsers = lib.any (route: route.identifyTailnetUsers) (
     lib.attrValues hostProxyConfiguration.routes
   );
@@ -90,9 +99,7 @@ in
               '';
             };
             bearerTokenDigests = lib.mkOption {
-              type = lib.types.nullOr (
-                lib.types.nonEmptyListOf (lib.types.strMatching "[0-9a-fA-F]{64}")
-              );
+              type = lib.types.nullOr (lib.types.nonEmptyListOf (lib.types.strMatching "[0-9a-fA-F]{64}"));
               default = null;
               example = [ "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" ];
               description = ''
@@ -124,13 +131,60 @@ in
             allowedClientNetworks = lib.mkOption {
               type = lib.types.nullOr (lib.types.nonEmptyListOf lib.types.str);
               default = null;
-              example = [ "192.0.2.0/24" "2001:db8::/32" ];
+              example = [
+                "192.0.2.0/24"
+                "2001:db8::/32"
+              ];
               description = ''
                 Networks, in address/prefix form, that may reach this route.
                 Every other client gets a 403 before authentication or
                 proxying. Null accepts any client the access setting allows.
                 Suits a public route only a known service should call, such as
                 a provider's published outbound ranges.
+              '';
+            };
+            bearerTokenDigestsByIdentity = lib.mkOption {
+              type = lib.types.nullOr (
+                lib.types.attrsOf (
+                  lib.types.coercedTo tokenDigest lib.toList (lib.types.nonEmptyListOf tokenDigest)
+                )
+              );
+              default = null;
+              example = {
+                "fbrmarble.pan" = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+              };
+              description = ''
+                Accepted bearer tokens keyed by the identity each one stands for,
+                as SHA-256 digests like bearerTokenDigests. An identity is made of
+                letters, digits, '.', '_' and '-', at most 150 characters. Give an
+                identity a list of digests to rotate its token without downtime.
+                Combine with identityHeader to tell the upstream who is calling.
+                Ignored for redirects.
+              '';
+            };
+            identityHeader = lib.mkOption {
+              type = lib.types.nullOr (lib.types.strMatching "[A-Za-z0-9-]+");
+              default = null;
+              example = "X-Scope-OrgID";
+              description = ''
+                Header that carries the identity of the presented token to the
+                upstream, such as the X-Scope-OrgID tenant of Loki or Mimir. Any
+                value the client sent in it is removed, so the upstream can trust
+                it. Requires bearerTokenDigestsByIdentity, and then refuses
+                tokens from bearerTokenDigests, which name no identity.
+              '';
+            };
+            allowedPaths = lib.mkOption {
+              type = lib.types.nullOr (lib.types.nonEmptyListOf (lib.types.strMatching "/[^,!+[:space:]]*"));
+              default = null;
+              example = [ "/loki/api/v1/push" ];
+              description = ''
+                Exact request paths this route forwards. Every other path gets a
+                403 before authentication or proxying. The query string is not
+                compared, and encoded or dot-segment variants of a path are
+                refused rather than normalised. Suits an ingest route whose
+                tokens must only reach the write endpoints of a store that also
+                serves reads. Null forwards every path.
               '';
             };
           };
@@ -224,6 +278,43 @@ in
         message = ''
           services.hostProxy.routes."${hostname}" sets bearerTokenDigests on a
           redirect, which is never authenticated. Remove one of them.
+        '';
+      }) hostProxyConfiguration.routes
+      ++ lib.mapAttrsToList (hostname: route: {
+        assertion =
+          route.identityHeader == null
+          || (route.bearerTokenDigestsByIdentity != null && route.bearerTokenDigestsByIdentity != { });
+        message = ''
+          services.hostProxy.routes."${hostname}" sets identityHeader without any
+          bearerTokenDigestsByIdentity, so there is no identity to pass upstream.
+        '';
+      }) hostProxyConfiguration.routes
+      ++ lib.mapAttrsToList (hostname: route: {
+        assertion = route.identityHeader == null || route.bearerTokenDigests == null;
+        message = ''
+          services.hostProxy.routes."${hostname}" sets identityHeader alongside
+          bearerTokenDigests, whose tokens name no identity and would be refused.
+          Move them into bearerTokenDigestsByIdentity.
+        '';
+      }) hostProxyConfiguration.routes
+      ++ lib.mapAttrsToList (hostname: route: {
+        assertion = lib.all (identity: builtins.match tokenIdentityPattern identity != null) (
+          lib.attrNames (
+            lib.optionalAttrs (route.bearerTokenDigestsByIdentity != null) route.bearerTokenDigestsByIdentity
+          )
+        );
+        message = ''
+          services.hostProxy.routes."${hostname}".bearerTokenDigestsByIdentity
+          has an identity that is not 1 to 150 letters, digits, '.', '_' or '-'.
+        '';
+      }) hostProxyConfiguration.routes
+      ++ lib.mapAttrsToList (hostname: route: {
+        assertion =
+          route.redirectTo == null
+          || (route.bearerTokenDigestsByIdentity == null && route.allowedPaths == null);
+        message = ''
+          services.hostProxy.routes."${hostname}" sets bearerTokenDigestsByIdentity
+          or allowedPaths on a redirect, which never reaches an upstream.
         '';
       }) hostProxyConfiguration.routes
       ++ lib.mapAttrsToList (hostname: route: {

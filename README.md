@@ -51,6 +51,20 @@ public route that only a known service should call, such as a provider's
 published outbound ranges. It composes with the other rules, so a private route
 with networks requires both.
 
+Any proxied route can also **accept only listed paths**: a request whose path is
+not exactly one of them gets a 403 before authentication or proxying. The query
+string is not compared, and encoded or dot-segment variants are refused rather
+than normalised. It suits an ingest route whose tokens should reach only the
+write endpoints of a store that also serves reads.
+
+An authenticated route can also **pass the token's identity upstream**. Each
+line of its digest file then names the identity its token stands for after the
+digest, such as `9f86…0a08 fbrmarble.pan`, and host-proxy sets that identity in
+a chosen header, removing any value the client sent. An upstream can trust it,
+for example as the `X-Scope-OrgID` tenant of Loki or Mimir, so each client can
+only ever write as itself. Identities are letters, digits, `.`, `_` and `-`, at
+most 150 characters.
+
 - **Redirect**, which answers `301` with `Location: https://<target><path>`.
   TLS still terminates here, so a certificate covering the redirected
   hostname is required. The target is fixed configuration and is never taken
@@ -68,6 +82,10 @@ The `host-proxy` binary reads these environment variables:
     users.
   - `hostname=host:port!networks=192.0.2.0/24+2001:db8::/32` — proxy that
     accepts only clients inside the `+`-separated networks.
+  - `hostname=host:port!paths=/loki/api/v1/push+/api/v1/push` — proxy that
+    forwards only the `+`-separated paths.
+  - `hostname=host:port!bearer-sha256=/path/to/digests!identity-header=X-Scope-OrgID`
+    — authenticated proxy that passes each token's identity upstream.
   - `hostname=>targethost` — permanent redirect to `https://targethost`.
 
   Tags combine, so `hostname=host:port!private!bearer-sha256=/path/to/digests`
@@ -117,6 +135,14 @@ services.hostProxy = {
     "connector.example.org" = {
       upstreamAddress = "127.0.0.1:7000";
       allowedClientNetworks = [ "192.0.2.0/24" "2001:db8::/32" ];
+    };
+    "logs.example.org" = {
+      upstreamAddress = "127.0.0.1:3100";
+      allowedPaths = [ "/loki/api/v1/push" ];
+      identityHeader = "X-Scope-OrgID";
+      bearerTokenDigestsByIdentity = {
+        "fbrmarble.pan" = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+      };
     };
     "www.example.org" = { redirectTo = "example.org"; };
   };
