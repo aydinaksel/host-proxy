@@ -91,6 +91,9 @@
           ];
 
           ZSTD_SYS_USE_PKG_CONFIG = "1";
+          RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
+          SCCACHE_SERVER_PORT = toString (4200 + pkgs.lib.toInt (pkgs.lib.versions.minor pkgs.sccache.version));
+          SCCACHE_CACHE_SIZE = "50G";
         };
       }
     );
